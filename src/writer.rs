@@ -2,7 +2,11 @@
 //!
 //! This module is only compiled when the `inprocess` feature is enabled.
 
-use std::time::Duration;
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use rusqlite::{Connection, TransactionBehavior, types::Value};
 use tokio::sync::{mpsc, oneshot};
@@ -34,6 +38,38 @@ pub(crate) enum Command {
 }
 
 // ---------------------------------------------------------------------------
+// LatencyBuffer — shared ring buffer for commit latency (§24)
+// ---------------------------------------------------------------------------
+
+/// Ring buffer storing per-commit latency measurements in microseconds (§24).
+///
+/// Capped at `LATENCY_BUF_CAP` entries; oldest entries are evicted when full.
+pub(crate) const LATENCY_BUF_CAP: usize = 1024;
+
+/// Shared ring buffer for commit latency (§24 avg_commit_latency / p95_commit_latency).
+///
+/// The writer pushes one entry per successful commit; `GatewayHandle` reads a
+/// snapshot to compute avg / p95 on demand.
+pub(crate) type LatencyBuffer = Arc<Mutex<VecDeque<u64>>>;
+
+/// Create a new, empty [`LatencyBuffer`].
+pub(crate) fn new_latency_buffer() -> LatencyBuffer {
+    Arc::new(Mutex::new(VecDeque::with_capacity(LATENCY_BUF_CAP)))
+}
+
+/// Push a latency measurement into the ring buffer.
+///
+/// When the buffer is full, the oldest entry is popped first (FIFO eviction).
+fn push_latency(buf: &LatencyBuffer, micros: u64) {
+    if let Ok(mut guard) = buf.lock() {
+        if guard.len() >= LATENCY_BUF_CAP {
+            guard.pop_front();
+        }
+        guard.push_back(micros);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Writer struct (§28)
 // ---------------------------------------------------------------------------
 
@@ -46,6 +82,9 @@ pub(crate) struct Writer {
     conn: Connection,
     receiver: mpsc::Receiver<Command>,
     track_commits: bool,
+    idempotency: bool,
+    config: GatewayConfig,
+    latency_buf: LatencyBuffer,
 }
 
 impl Writer {
@@ -54,11 +93,17 @@ impl Writer {
         conn: Connection,
         receiver: mpsc::Receiver<Command>,
         track_commits: bool,
+        idempotency: bool,
+        config: GatewayConfig,
+        latency_buf: LatencyBuffer,
     ) -> Self {
         Self {
             conn,
             receiver,
             track_commits,
+            idempotency,
+            config,
+            latency_buf,
         }
     }
 
@@ -70,6 +115,22 @@ impl Writer {
     ///
     /// After the loop exits, a WAL checkpoint is attempted to minimise the
     /// amount of WAL data left on disk (§16 shutdown checkpoint).
+    ///
+    /// ### Batching (§15)
+    ///
+    /// When `config.batch` is `Some(_)`, after receiving the first `Write`
+    /// command the writer drains additional `Write` commands from the queue
+    /// using `try_recv` (non-blocking, greedy). Only requests with a single
+    /// operation are batched ("single-INSERT" class, §15). Multi-op requests,
+    /// `Shutdown`, and `Checkpoint` commands encountered during drain terminate
+    /// the drain phase; the drained multi-op request is applied individually
+    /// after the batch commits, and control commands are handled in the next
+    /// iteration.
+    ///
+    /// This greedy approach approximates §15's "collect for a short time" intent
+    /// without a real timer: requests that arrive within the same OS scheduling
+    /// quantum (typically a few hundred microseconds) are bundled together,
+    /// which is the common case under high concurrency.
     pub(crate) fn run(mut self) {
         while let Some(cmd) = self.receiver.blocking_recv() {
             match cmd {
@@ -77,10 +138,92 @@ impl Writer {
                     request,
                     respond_to,
                 } => {
-                    let response = self.apply(request);
-                    // If the caller dropped its oneshot receiver we simply
-                    // discard the response; the writer loop must continue.
-                    let _ = respond_to.send(response);
+                    if self.config.batch.is_some() {
+                        // §15 — batch mode: only single-op requests are batchable.
+                        // A multi-op request represents an explicit transaction (§15)
+                        // and must be processed individually to preserve semantics.
+                        if request.operations.len() != 1 {
+                            let response = self.apply(request);
+                            let _ = respond_to.send(response);
+                        } else {
+                            // §15 — greedily collect additional single-op Write commands
+                            // from the queue, then commit them together in one outer tx.
+                            let mut batch: Vec<(WriteRequest, oneshot::Sender<WriteResponse>)> =
+                                vec![(request, respond_to)];
+
+                            let max_size = self
+                                .config
+                                .batch
+                                .as_ref()
+                                .map(|b| b.max_size)
+                                .unwrap_or(64);
+
+                            // `deferred_cmd` holds a non-batchable command that was
+                            // popped from the queue during drain and must be processed
+                            // after the batch commits.
+                            let mut deferred_cmd: Option<Command> = None;
+
+                            while batch.len() < max_size {
+                                match self.receiver.try_recv() {
+                                    Ok(Command::Write {
+                                        request: r2,
+                                        respond_to: rt2,
+                                    }) => {
+                                        if r2.operations.len() == 1 {
+                                            // Single-op: batchable (§15 "single INSERT").
+                                            batch.push((r2, rt2));
+                                        } else {
+                                            // Multi-op = explicit transaction (§15
+                                            // "don't mix explicit transaction requests").
+                                            // Apply this request individually after the
+                                            // batch commits.
+                                            deferred_cmd =
+                                                Some(Command::Write { request: r2, respond_to: rt2 });
+                                            break;
+                                        }
+                                    }
+                                    Ok(ctrl @ (Command::Shutdown | Command::Checkpoint { .. })) => {
+                                        // Control command: defer, finish batch first.
+                                        deferred_cmd = Some(ctrl);
+                                        break;
+                                    }
+                                    Err(_) => break, // Queue empty.
+                                }
+                            }
+
+                            if batch.len() == 1 {
+                                // Only one request collected — skip batch overhead,
+                                // apply as a single transaction.
+                                let (req, rt) = batch.pop().unwrap();
+                                let response = self.apply(req);
+                                let _ = rt.send(response);
+                            } else {
+                                self.apply_batch(batch);
+                            }
+
+                            // Process the deferred command if any.
+                            if let Some(cmd) = deferred_cmd {
+                                match cmd {
+                                    Command::Write { request, respond_to } => {
+                                        let response = self.apply(request);
+                                        let _ = respond_to.send(response);
+                                    }
+                                    Command::Shutdown => break,
+                                    Command::Checkpoint { respond_to } => {
+                                        let result = self
+                                            .conn
+                                            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                                            .map_err(Error::Sqlite);
+                                        let _ = respond_to.send(result);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Default (no batching): 1 request = 1 transaction.
+                        let response = self.apply(request);
+                        let _ = respond_to.send(response);
+                    }
                 }
                 Command::Shutdown => break,
                 Command::Checkpoint { respond_to } => {
@@ -100,29 +243,131 @@ impl Writer {
     }
 
     // -----------------------------------------------------------------------
-    // apply — §11 transaction semantics + §12 commit_seq
+    // apply — §11 transaction semantics + §12 commit_seq + §13 idempotency
     // -----------------------------------------------------------------------
 
     /// Execute one [`WriteRequest`] as a single `BEGIN IMMEDIATE` transaction
     /// (§11) and return a [`WriteResponse`].
     ///
     /// Flow:
-    /// 1. Validate each operation's SQL prefix (§10).
-    /// 2. `BEGIN IMMEDIATE` (§11).
-    /// 3. Execute each operation with bound params.
-    /// 4. If `track_commits` is set, INSERT into `squeuelite_commits` (§12).
-    /// 5. `COMMIT`.
-    fn apply(&mut self, request: WriteRequest) -> WriteResponse {
+    /// 1. Validate each operation's SQL (§10, §23).
+    /// 2. If `idempotency_key` is set and `config.idempotency=true`, check
+    ///    `squeuelite_requests` for a prior result (§13).
+    /// 3. `BEGIN IMMEDIATE` (§11).
+    /// 4. Execute each operation with bound params.
+    /// 5. If `track_commits` is set, INSERT into `squeuelite_commits` (§12).
+    /// 6. If idempotency is active, INSERT into `squeuelite_requests` (§13).
+    /// 7. `COMMIT`. Record latency (§24).
+    pub(crate) fn apply(&mut self, request: WriteRequest) -> WriteResponse {
         let req_id = request.request_id.clone();
 
-        // Step 1 — SQL constraint checks (§10, transaction not yet open).
+        // Step 1 — SQL constraint checks (§10, §23, transaction not yet open).
         for op in &request.operations {
-            if let Err(e) = reject_forbidden_sql(&op.sql) {
+            if let Err(e) = validate_sql(&op.sql, &self.config) {
                 return WriteResponse::failed(req_id, e.to_string());
             }
         }
 
-        // Step 2 — BEGIN IMMEDIATE (§11, tech-validation confirmed API).
+        // Step 2 — Idempotency check (§13).
+        // If `idempotency_key` is present and idempotency is enabled, query
+        // the squeuelite_requests table before opening the write transaction.
+        if self.idempotency {
+            if let Some(ref key) = request.idempotency_key {
+                let request_hash = match serde_json::to_string(&request.operations) {
+                    Ok(s) => s,
+                    Err(e) => return WriteResponse::failed(req_id, e.to_string()),
+                };
+
+                // Read-only query — no transaction needed.
+                match self.conn.query_row(
+                    "SELECT request_hash, response_json FROM squeuelite_requests WHERE idempotency_key = ?1",
+                    rusqlite::params![key],
+                    |row| {
+                        let stored_hash: String = row.get(0)?;
+                        let response_json: Option<String> = row.get(1)?;
+                        Ok((stored_hash, response_json))
+                    },
+                ) {
+                    Ok((stored_hash, response_json)) => {
+                        // Row exists.
+                        if stored_hash == request_hash {
+                            // §13 re-send: same hash → return stored response.
+                            if let Some(json) = response_json {
+                                if let Ok(resp) = serde_json::from_str::<WriteResponse>(&json) {
+                                    return resp;
+                                }
+                            }
+                            // Fallback: stored response missing or unparseable —
+                            // treat as idempotent committed (conservative).
+                            return WriteResponse::committed(req_id, None);
+                        } else {
+                            // §13 conflict: same key, different operations.
+                            return WriteResponse::failed(
+                                req_id,
+                                Error::IdempotencyConflict(key.clone()).to_string(),
+                            );
+                        }
+                    }
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        // First time we see this key — proceed with normal execution.
+                    }
+                    Err(e) => return WriteResponse::failed(req_id, e.to_string()),
+                }
+
+                // Normal execution path for a new idempotency key.
+                return self.apply_with_idempotency(request, &request_hash);
+            }
+        }
+
+        // No idempotency key (or idempotency disabled) — standard path.
+        self.apply_inner(request)
+    }
+
+    /// Execute a request and record its result in `squeuelite_requests` (§13).
+    ///
+    /// Called only when `idempotency=true` and the key is new.
+    fn apply_with_idempotency(&mut self, request: WriteRequest, request_hash: &str) -> WriteResponse {
+        let key = request.idempotency_key.clone().unwrap_or_default();
+
+        let response = self.apply_inner(request);
+
+        // Only persist a successful commit in the idempotency table.
+        // On failure the transaction was rolled back, so the key row must NOT
+        // be inserted — a failed request is always retryable (§13: "失敗は再実行可能").
+        if response.status == crate::request::WriteStatus::Committed {
+            let response_json = serde_json::to_string(&response).unwrap_or_default();
+            let commit_seq = response.commit_seq;
+            // Insert outside the (already committed) transaction.
+            // A separate write is fine: if this fails the client gets a Committed
+            // response but the idempotency row is absent, meaning the next retry
+            // will re-execute. This is a mild safety trade-off (at-most-once vs.
+            // at-least-once); it favours correctness (never silently ignoring a
+            // new request) over deduplication guarantees.
+            //
+            // A production implementation would include this INSERT inside the same
+            // transaction as the write ops. For the MVP the simple two-phase approach
+            // is sufficient.
+            let _ = self.conn.execute(
+                "INSERT OR IGNORE INTO squeuelite_requests \
+                 (idempotency_key, request_hash, status, response_json, commit_seq) \
+                 VALUES (?1, ?2, 'committed', ?3, ?4)",
+                rusqlite::params![key, request_hash, response_json, commit_seq],
+            );
+        }
+
+        response
+    }
+
+    /// Core transaction execution logic for single-request paths.
+    ///
+    /// Opens a `BEGIN IMMEDIATE` transaction, executes all ops, and commits.
+    /// Savepoint-based execution for batches is handled separately by
+    /// [`Self::apply_savepoint`].
+    fn apply_inner(&mut self, request: WriteRequest) -> WriteResponse {
+        let req_id = request.request_id.clone();
+        let start = Instant::now();
+
+        // BEGIN IMMEDIATE (§11).
         let tx = match self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -131,21 +376,18 @@ impl Writer {
             Err(e) => return WriteResponse::failed(req_id, e.to_string()),
         };
 
-        // Step 3 — execute each operation.
+        // Execute each operation.
         for op in &request.operations {
             let params = match params_from(&op.params) {
                 Ok(p) => p,
                 Err(e) => return WriteResponse::failed(req_id, e.to_string()),
             };
-            // rusqlite::execute() rejects multiple statements automatically
-            // (returns Error::MultipleStatement), fulfilling §10's "no multiple
-            // statements" constraint without additional application-level checks.
             if let Err(e) = tx.execute(&op.sql, rusqlite::params_from_iter(params.iter())) {
                 return WriteResponse::failed(req_id, e.to_string());
             }
         }
 
-        // Step 4 — record commit (§12).
+        // §12 — record commit.
         let commit_seq: Option<i64> = if self.track_commits {
             let insert_result = tx.execute(
                 "INSERT INTO squeuelite_commits(request_id, actor_id, run_id) VALUES (?, ?, ?)",
@@ -163,56 +405,341 @@ impl Writer {
             None
         };
 
-        // Step 5 — COMMIT.
+        // COMMIT.
         match tx.commit() {
-            Ok(_) => WriteResponse::committed(req_id, commit_seq),
+            Ok(_) => {
+                // §24 — record commit latency.
+                let micros = start.elapsed().as_micros() as u64;
+                push_latency(&self.latency_buf, micros);
+                WriteResponse::committed(req_id, commit_seq)
+            }
             Err(e) => WriteResponse::failed(req_id, e.to_string()),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_batch — §15 batch commit with per-request SAVEPOINTs
+    // -----------------------------------------------------------------------
+
+    /// Commit a batch of single-op requests inside one outer `BEGIN IMMEDIATE`
+    /// transaction, using SAVEPOINTs for per-request isolation (§15).
+    ///
+    /// Design:
+    /// - One outer `transaction_with_behavior(Immediate)` wraps all requests.
+    /// - Each request gets its own savepoint (`SAVEPOINT sp_N`).
+    /// - On success: `RELEASE sp_N` (commits the savepoint).
+    /// - On failure: `ROLLBACK TO sp_N` then `RELEASE sp_N` (drops that
+    ///   savepoint without rolling back the outer tx), so other requests are
+    ///   unaffected (§15 "各requestを他に巻き込まない").
+    /// - Idempotency-key requests in the batch follow §13 logic per savepoint;
+    ///   the idempotency INSERT is included inside the same savepoint scope
+    ///   (§15 "idempotency付きrequestは順序とresponse保存に注意").
+    /// - After all requests are processed, the outer tx is COMMITted.
+    /// - Each `respond_to` sender is notified with its individual result
+    ///   (§15 "各requestへ個別responseを返す").
+    ///
+    /// Edge-case notes (§15 implementation comments):
+    /// - A failed savepoint leaves a `commit_seq` gap (the AUTOINCREMENT counter
+    ///   was not advanced for that request). This is expected and benign — gaps
+    ///   in commit_seq are documented as possible by design.
+    /// - An idempotency hit inside a batch (duplicate key, same hash) returns
+    ///   the stored response immediately without opening a savepoint. A conflict
+    ///   (same key, different hash) returns a Failed response the same way.
+    fn apply_batch(&mut self, batch: Vec<(WriteRequest, oneshot::Sender<WriteResponse>)>) {
+        let start = Instant::now();
+
+        // Open the outer transaction.
+        let tx = match self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+        {
+            Ok(tx) => tx,
+            Err(e) => {
+                // If we can't open the outer tx, fail all requests in the batch.
+                let err = e.to_string();
+                for (req, rt) in batch {
+                    let _ = rt.send(WriteResponse::failed(req.request_id.clone(), err.clone()));
+                }
+                return;
+            }
+        };
+
+        let mut responses: Vec<(oneshot::Sender<WriteResponse>, WriteResponse)> = Vec::new();
+
+        for (idx, (request, respond_to)) in batch.into_iter().enumerate() {
+            let req_id = request.request_id.clone();
+
+            // §10/§23 — SQL constraint checks (must match apply()'s check).
+            // Validate before opening a savepoint so that a rejected request
+            // results in a Failed response without touching the database.
+            {
+                let mut validation_err: Option<String> = None;
+                for op in &request.operations {
+                    if let Err(e) = validate_sql(&op.sql, &self.config) {
+                        validation_err = Some(e.to_string());
+                        break;
+                    }
+                }
+                if let Some(err) = validation_err {
+                    responses.push((respond_to, WriteResponse::failed(req_id, err)));
+                    continue;
+                }
+            }
+
+            // §13 — idempotency check within the batch.
+            if self.idempotency {
+                if let Some(ref key) = request.idempotency_key {
+                    let request_hash = match serde_json::to_string(&request.operations) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            responses.push((respond_to, WriteResponse::failed(req_id, e.to_string())));
+                            continue;
+                        }
+                    };
+
+                    match tx.query_row(
+                        "SELECT request_hash, response_json FROM squeuelite_requests WHERE idempotency_key = ?1",
+                        rusqlite::params![key],
+                        |row| {
+                            let h: String = row.get(0)?;
+                            let r: Option<String> = row.get(1)?;
+                            Ok((h, r))
+                        },
+                    ) {
+                        Ok((stored_hash, response_json)) => {
+                            if stored_hash == request_hash {
+                                let resp = response_json
+                                    .and_then(|j| serde_json::from_str::<WriteResponse>(&j).ok())
+                                    .unwrap_or_else(|| WriteResponse::committed(req_id.clone(), None));
+                                responses.push((respond_to, resp));
+                                continue;
+                            } else {
+                                let resp = WriteResponse::failed(
+                                    req_id,
+                                    Error::IdempotencyConflict(key.clone()).to_string(),
+                                );
+                                responses.push((respond_to, resp));
+                                continue;
+                            }
+                        }
+                        Err(rusqlite::Error::QueryReturnedNoRows) => {
+                            // New key — proceed.
+                        }
+                        Err(e) => {
+                            responses.push((respond_to, WriteResponse::failed(req_id, e.to_string())));
+                            continue;
+                        }
+                    }
+
+                    // Execute inside a savepoint with idempotency INSERT.
+                    let sp_name = format!("sp_{idx}");
+                    let sp_resp = Self::apply_savepoint(
+                        &tx,
+                        &request,
+                        &sp_name,
+                        self.track_commits,
+                        Some((key, &request_hash)),
+                    );
+                    responses.push((respond_to, sp_resp));
+                    continue;
+                }
+            }
+
+            // No idempotency key — plain savepoint execution.
+            let sp_name = format!("sp_{idx}");
+            let sp_resp = Self::apply_savepoint(&tx, &request, &sp_name, self.track_commits, None);
+            responses.push((respond_to, sp_resp));
+        }
+
+        // Commit the outer transaction.
+        match tx.commit() {
+            Ok(_) => {
+                // §24 — record batch latency as one entry (entire batch).
+                let micros = start.elapsed().as_micros() as u64;
+                push_latency(&self.latency_buf, micros);
+                // Send all individual responses.
+                for (rt, resp) in responses {
+                    let _ = rt.send(resp);
+                }
+            }
+            Err(e) => {
+                // Outer commit failed — fail all requests.
+                let err = e.to_string();
+                for (rt, resp) in responses {
+                    // Failed savepoints already carry their own error; only
+                    // override Committed responses (the outer commit rolled them back).
+                    let final_resp = if resp.status == crate::request::WriteStatus::Committed {
+                        WriteResponse::failed(resp.request_id, err.clone())
+                    } else {
+                        resp
+                    };
+                    let _ = rt.send(final_resp);
+                }
+            }
+        }
+    }
+
+    /// Execute a single request inside a named SAVEPOINT within an existing
+    /// outer transaction.
+    ///
+    /// `idempotency_record`: `Some((key, hash))` to also INSERT into
+    /// `squeuelite_requests` inside this savepoint (§13 + §15 interaction).
+    ///
+    /// Returns the [`WriteResponse`] for this individual request.
+    fn apply_savepoint(
+        tx: &rusqlite::Transaction<'_>,
+        request: &WriteRequest,
+        sp_name: &str,
+        track_commits: bool,
+        idempotency_record: Option<(&str, &str)>,
+    ) -> WriteResponse {
+        let req_id = request.request_id.clone();
+
+        // Open savepoint.
+        if let Err(e) = tx.execute_batch(&format!("SAVEPOINT {sp_name};")) {
+            return WriteResponse::failed(req_id, e.to_string());
+        }
+
+        // Helper macro to rollback-then-release on error.
+        macro_rules! sp_fail {
+            ($err:expr) => {{
+                let _ = tx.execute_batch(&format!("ROLLBACK TO {sp_name}; RELEASE {sp_name};"));
+                return WriteResponse::failed(req_id, $err.to_string());
+            }};
+        }
+
+        // Execute each operation (batch only admits single-op requests, but
+        // the function is general to handle future changes).
+        for op in &request.operations {
+            let params = match params_from(&op.params) {
+                Ok(p) => p,
+                Err(e) => sp_fail!(e),
+            };
+            if let Err(e) = tx.execute(&op.sql, rusqlite::params_from_iter(params.iter())) {
+                sp_fail!(e);
+            }
+        }
+
+        // §12 — commit tracking.
+        let commit_seq: Option<i64> = if track_commits {
+            match tx.execute(
+                "INSERT INTO squeuelite_commits(request_id, actor_id, run_id) VALUES (?, ?, ?)",
+                rusqlite::params![request.request_id, request.actor_id, request.run_id],
+            ) {
+                Ok(_) => Some(tx.last_insert_rowid()),
+                Err(e) => sp_fail!(e),
+            }
+        } else {
+            None
+        };
+
+        // §13 — idempotency record (if requested).
+        if let Some((key, hash)) = idempotency_record {
+            let resp_preview = WriteResponse::committed(req_id.clone(), commit_seq);
+            let response_json = serde_json::to_string(&resp_preview).unwrap_or_default();
+            if let Err(e) = tx.execute(
+                "INSERT OR IGNORE INTO squeuelite_requests \
+                 (idempotency_key, request_hash, status, response_json, commit_seq) \
+                 VALUES (?1, ?2, 'committed', ?3, ?4)",
+                rusqlite::params![key, hash, response_json, commit_seq],
+            ) {
+                sp_fail!(e);
+            }
+        }
+
+        // Release (commit) the savepoint.
+        if let Err(e) = tx.execute_batch(&format!("RELEASE {sp_name};")) {
+            sp_fail!(e);
+        }
+
+        WriteResponse::committed(req_id, commit_seq)
     }
 }
 
 // ---------------------------------------------------------------------------
-// SQL constraint enforcement (§10)
+// SQL constraint enforcement (§10, §23)
 // ---------------------------------------------------------------------------
 
-/// Reject SQL statements whose first token is a forbidden keyword (§10).
+/// Validate a SQL statement against gateway constraints (§10) and the
+/// security / safety flags from [`GatewayConfig`] (§23).
 ///
-/// The gateway owns the transaction lifecycle; allowing callers to issue
-/// `BEGIN`, `COMMIT`, `ROLLBACK`, or `SAVEPOINT` would break the 1-request =
-/// 1-transaction guarantee. `PRAGMA` is similarly forbidden because gateway
-/// configuration is managed exclusively at startup.
+/// Checks performed (in order):
 ///
-/// **`DELETE` and `DROP` are intentionally not in the forbidden list** (§23
-/// MVP decision). The current MVP assumes trusted in-process agents, so
-/// destructive operations are permitted. Future versions may add
-/// `allow_delete` / `allow_drop` flags to [`crate::config::GatewayConfig`]
-/// to give callers explicit control (§10 future extension).
+/// 1. **`allow_raw_sql`** (§23): when `false`, all SQL is rejected because the
+///    MVP only supports raw SQL. Future typed operations (§10) would bypass this.
+/// 2. **Transaction control keywords** (§10): `BEGIN`, `COMMIT`, `ROLLBACK`,
+///    `SAVEPOINT`, `RELEASE`, and `PRAGMA` are always forbidden regardless of
+///    flags. The gateway owns the transaction lifecycle; callers must not alter it.
+/// 3. **`allow_drop`** (§23): when `false`, statements starting with `DROP`
+///    are rejected.
+/// 4. **`allow_delete`** (§23): when `false`, statements starting with `DELETE`
+///    are rejected.
+/// 5. **`allow_schema_write`** (§23): when `false`, schema-mutating statements
+///    (`CREATE`, `ALTER`, `DROP`, `TRUNCATE`) are rejected. Note that `DROP` may
+///    also be caught by rule 3; both rules apply independently.
 ///
-/// **Implementation note**: only the *first token* of the (trimmed) SQL string
-/// is checked. Comments at the very start (`-- ...` or `/* */`) and string
-/// literals that happen to contain a forbidden keyword are *not* detected. This
-/// is an intentional trade-off: a complete SQL parser would add significant
-/// complexity for marginal security benefit given that callers are trusted
-/// in-process agents (§23).
-fn reject_forbidden_sql(sql: &str) -> Result<()> {
+/// **Future work** (§23): operation / table allowlist (`allowlist.tables = …`)
+/// is marked as a future item in the design spec and is intentionally not
+/// implemented here. A comment below marks the insertion point.
+///
+/// **Implementation note**: only the *first token* of the trimmed SQL string is
+/// checked. Comments at the very start (`-- …` / `/* … */`) and string literals
+/// that contain a keyword are not detected — an intentional trade-off (a full
+/// SQL parser is overkill given trusted in-process callers, §23).
+pub(crate) fn validate_sql(sql: &str, config: &GatewayConfig) -> Result<()> {
+    // Rule 1 — §23 allow_raw_sql: when false, reject all SQL (MVP: raw SQL is
+    // the only operation type; future typed operations would bypass this flag,
+    // §10 future extension).
+    if !config.allow_raw_sql {
+        return Err(Error::SqlRejected(
+            "raw SQL is disabled (allow_raw_sql = false)".to_string(),
+        ));
+    }
+
     let first_token = sql
         .trim_start()
         .split_ascii_whitespace()
         .next()
         .unwrap_or("");
+    let upper = first_token.to_ascii_uppercase();
+    let token = upper.as_str();
 
-    let forbidden = matches!(
-        first_token.to_ascii_uppercase().as_str(),
+    // Rule 2 — §10 transaction control keywords (always forbidden).
+    if matches!(
+        token,
         "BEGIN" | "COMMIT" | "ROLLBACK" | "SAVEPOINT" | "RELEASE" | "PRAGMA"
-    );
-
-    if forbidden {
-        Err(Error::SqlRejected(format!(
+    ) {
+        return Err(Error::SqlRejected(format!(
             "statement starts with forbidden keyword '{first_token}'"
-        )))
-    } else {
-        Ok(())
+        )));
     }
+
+    // Rule 3 — §23 allow_drop.
+    if token == "DROP" && !config.allow_drop {
+        return Err(Error::SqlRejected(
+            "DROP statements are disabled (allow_drop = false)".to_string(),
+        ));
+    }
+
+    // Rule 4 — §23 allow_delete.
+    if token == "DELETE" && !config.allow_delete {
+        return Err(Error::SqlRejected(
+            "DELETE statements are disabled (allow_delete = false)".to_string(),
+        ));
+    }
+
+    // Rule 5 — §23 allow_schema_write (CREATE / ALTER / DROP / TRUNCATE).
+    if matches!(token, "CREATE" | "ALTER" | "DROP" | "TRUNCATE") && !config.allow_schema_write {
+        return Err(Error::SqlRejected(format!(
+            "schema-write statements are disabled (allow_schema_write = false); \
+             statement starts with '{first_token}'"
+        )));
+    }
+
+    // Future §23 — operation / table allowlist (`allowlist.tables = [...]`).
+    // The design spec marks this as a future item; no implementation yet.
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -263,9 +790,16 @@ fn json_to_sqlite(v: &serde_json::Value) -> Result<Value> {
 /// When `track_commits` is `false` the `squeuelite_commits` table is **not**
 /// created, saving the overhead for high-throughput use cases.
 ///
-/// The `squeuelite_requests` idempotency table (§13) is intentionally omitted
-/// in the in-process MVP; it will be added in the sidecar phase.
-pub(crate) fn run_migrations(conn: &Connection, track_commits: bool) -> Result<()> {
+/// When `idempotency` is `true` (the default, §13), the `squeuelite_requests`
+/// table is created with the DDL from §13 of the design specification.
+/// When `false`, no idempotency table is created and idempotency keys in
+/// requests are silently ignored.
+///
+/// **Note**: startup migration runs on the writer's `Connection` directly,
+/// before the writer thread starts accepting requests. It is NOT subject to
+/// the `validate_sql` security checks (§23) — those apply only to user-supplied
+/// SQL arriving via the write channel. Internal DDL is always permitted.
+pub(crate) fn run_migrations(conn: &Connection, track_commits: bool, idempotency: bool) -> Result<()> {
     if track_commits {
         // §12 DDL — verbatim from the design specification.
         conn.execute_batch(
@@ -279,6 +813,23 @@ pub(crate) fn run_migrations(conn: &Connection, track_commits: bool) -> Result<(
         )
         .map_err(|e| Error::Migration(e.to_string()))?;
     }
+
+    if idempotency {
+        // §13 DDL — verbatim from the design specification.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS squeuelite_requests (
+                idempotency_key TEXT PRIMARY KEY,
+                request_hash    TEXT NOT NULL,
+                status          TEXT NOT NULL,
+                response_json   TEXT,
+                commit_seq      INTEGER,
+                created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .map_err(|e| Error::Migration(e.to_string()))?;
+    }
+
     Ok(())
 }
 
@@ -322,8 +873,18 @@ pub(crate) fn apply_pragmas(conn: &Connection, config: &GatewayConfig) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request::{SqlOperation, WriteRequest};
+    use crate::{
+        config::GatewayConfig,
+        request::{SqlOperation, WriteRequest},
+    };
     use serde_json::json;
+
+    fn default_config() -> GatewayConfig {
+        GatewayConfig {
+            allow_schema_write: true, // tests need to CREATE tables via validate_sql
+            ..GatewayConfig::default()
+        }
+    }
 
     fn make_write_request(ops: Vec<(&str, Vec<serde_json::Value>)>) -> WriteRequest {
         WriteRequest {
@@ -342,74 +903,130 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // reject_forbidden_sql — keyword blocking
+    // validate_sql — keyword blocking (§10 forbidden keywords)
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_reject_begin() {
-        assert!(reject_forbidden_sql("BEGIN").is_err());
-        assert!(reject_forbidden_sql("  begin TRANSACTION").is_err());
-        assert!(reject_forbidden_sql("BEGIN IMMEDIATE").is_err());
+        let cfg = default_config();
+        assert!(validate_sql("BEGIN", &cfg).is_err());
+        assert!(validate_sql("  begin TRANSACTION", &cfg).is_err());
+        assert!(validate_sql("BEGIN IMMEDIATE", &cfg).is_err());
     }
 
     #[test]
     fn test_reject_commit() {
-        assert!(reject_forbidden_sql("COMMIT").is_err());
-        assert!(reject_forbidden_sql("commit").is_err());
+        let cfg = default_config();
+        assert!(validate_sql("COMMIT", &cfg).is_err());
+        assert!(validate_sql("commit", &cfg).is_err());
     }
 
     #[test]
     fn test_reject_rollback() {
-        assert!(reject_forbidden_sql("ROLLBACK").is_err());
+        let cfg = default_config();
+        assert!(validate_sql("ROLLBACK", &cfg).is_err());
     }
 
     #[test]
     fn test_reject_savepoint() {
-        assert!(reject_forbidden_sql("SAVEPOINT sp1").is_err());
+        let cfg = default_config();
+        assert!(validate_sql("SAVEPOINT sp1", &cfg).is_err());
     }
 
     #[test]
     fn test_reject_release() {
-        assert!(reject_forbidden_sql("RELEASE sp1").is_err());
+        let cfg = default_config();
+        assert!(validate_sql("RELEASE sp1", &cfg).is_err());
     }
 
     #[test]
     fn test_reject_pragma() {
-        assert!(reject_forbidden_sql("PRAGMA journal_mode").is_err());
-        assert!(reject_forbidden_sql("pragma journal_mode").is_err());
+        let cfg = default_config();
+        assert!(validate_sql("PRAGMA journal_mode", &cfg).is_err());
+        assert!(validate_sql("pragma journal_mode", &cfg).is_err());
     }
 
     #[test]
     fn test_allow_insert() {
-        assert!(reject_forbidden_sql("INSERT INTO t(v) VALUES (1)").is_ok());
+        let cfg = default_config();
+        assert!(validate_sql("INSERT INTO t(v) VALUES (1)", &cfg).is_ok());
     }
 
     #[test]
     fn test_allow_update() {
-        assert!(reject_forbidden_sql("UPDATE t SET v = 1").is_ok());
+        let cfg = default_config();
+        assert!(validate_sql("UPDATE t SET v = 1", &cfg).is_ok());
     }
 
     #[test]
-    fn test_allow_delete() {
-        // DELETE is intentionally NOT blocked in the MVP (§23, trusted agents).
-        assert!(reject_forbidden_sql("DELETE FROM t").is_ok());
+    fn test_allow_delete_default() {
+        // DELETE is allowed when allow_delete=true (default).
+        let cfg = default_config();
+        assert!(validate_sql("DELETE FROM t", &cfg).is_ok());
     }
 
     #[test]
-    fn test_allow_drop() {
-        // DROP is intentionally NOT blocked in the MVP (§23, trusted agents).
-        assert!(reject_forbidden_sql("DROP TABLE t").is_ok());
+    fn test_reject_delete_when_disabled() {
+        // §23 allow_delete=false → DELETE must be rejected.
+        let cfg = GatewayConfig {
+            allow_delete: false,
+            allow_schema_write: true,
+            ..GatewayConfig::default()
+        };
+        assert!(validate_sql("DELETE FROM t", &cfg).is_err());
     }
 
     #[test]
-    fn test_allow_create_table() {
-        assert!(reject_forbidden_sql("CREATE TABLE t (id INTEGER PRIMARY KEY)").is_ok());
+    fn test_allow_drop_when_enabled() {
+        // DROP allowed when both allow_drop=true and allow_schema_write=true.
+        let cfg = GatewayConfig {
+            allow_drop: true,
+            allow_schema_write: true,
+            ..GatewayConfig::default()
+        };
+        assert!(validate_sql("DROP TABLE t", &cfg).is_ok());
+    }
+
+    #[test]
+    fn test_reject_drop_default() {
+        // §23 allow_drop=false (default) → DROP must be rejected.
+        let cfg = GatewayConfig {
+            allow_schema_write: true, // allow_drop is false by default
+            ..GatewayConfig::default()
+        };
+        assert!(validate_sql("DROP TABLE t", &cfg).is_err());
+    }
+
+    #[test]
+    fn test_reject_create_when_schema_write_disabled() {
+        // §23 allow_schema_write=false (default) → CREATE must be rejected.
+        let cfg = GatewayConfig::default(); // allow_schema_write=false
+        assert!(validate_sql("CREATE TABLE t (id INTEGER PRIMARY KEY)", &cfg).is_err());
+    }
+
+    #[test]
+    fn test_allow_create_when_schema_write_enabled() {
+        let cfg = default_config(); // allow_schema_write=true
+        assert!(validate_sql("CREATE TABLE t (id INTEGER PRIMARY KEY)", &cfg).is_ok());
+    }
+
+    #[test]
+    fn test_reject_all_when_raw_sql_disabled() {
+        // §23 allow_raw_sql=false → all SQL rejected.
+        let cfg = GatewayConfig {
+            allow_raw_sql: false,
+            allow_schema_write: true,
+            ..GatewayConfig::default()
+        };
+        assert!(validate_sql("INSERT INTO t VALUES (1)", &cfg).is_err());
+        assert!(validate_sql("SELECT 1", &cfg).is_err());
     }
 
     #[test]
     fn test_mixed_case_begin() {
         // bEgIn should still be rejected (case-insensitive check).
-        assert!(reject_forbidden_sql("bEgIn TRANSACTION").is_err());
+        let cfg = default_config();
+        assert!(validate_sql("bEgIn TRANSACTION", &cfg).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -469,8 +1086,7 @@ mod tests {
     // apply — atomic rollback (unit test via direct Writer call)
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_apply_atomic_rollback() {
+    fn make_test_writer() -> Writer {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT NOT NULL);",
@@ -478,7 +1094,17 @@ mod tests {
         .unwrap();
 
         let (_, rx) = mpsc::channel(1);
-        let mut writer = Writer::new(conn, rx, false);
+        let config = GatewayConfig {
+            allow_schema_write: true,
+            ..GatewayConfig::default()
+        };
+        let latency_buf = new_latency_buffer();
+        Writer::new(conn, rx, false, true, config, latency_buf)
+    }
+
+    #[test]
+    fn test_apply_atomic_rollback() {
+        let mut writer = make_test_writer();
 
         // op1 succeeds (valid), op2 fails (NULL into NOT NULL col) → rollback.
         let req = make_write_request(vec![
@@ -499,5 +1125,283 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "rollback must leave the table empty");
+    }
+
+    // -----------------------------------------------------------------------
+    // §13 Idempotency tests
+    // -----------------------------------------------------------------------
+
+    fn make_idempotency_writer() -> Writer {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn, true, true).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT NOT NULL);",
+        )
+        .unwrap();
+
+        let (_, rx) = mpsc::channel(1);
+        let config = GatewayConfig {
+            allow_schema_write: true,
+            idempotency: true,
+            track_commits: true,
+            ..GatewayConfig::default()
+        };
+        let latency_buf = new_latency_buffer();
+        Writer::new(conn, rx, true, true, config, latency_buf)
+    }
+
+    #[test]
+    fn test_idempotency_second_call_returns_same_response() {
+        let mut writer = make_idempotency_writer();
+
+        let ops = vec![("INSERT INTO t(val) VALUES (?)", vec![json!("hello")])];
+        let mut req = make_write_request(ops);
+        req.request_id = "req-idem-1".to_string();
+        req.idempotency_key = Some("key-1".to_string());
+
+        // First call: executes and commits.
+        let resp1 = writer.apply(req.clone());
+        assert_eq!(resp1.status, crate::request::WriteStatus::Committed);
+
+        // Second call with same idempotency_key and same operations: must return
+        // the stored response without re-executing.
+        let resp2 = writer.apply(req.clone());
+        assert_eq!(resp2.status, crate::request::WriteStatus::Committed);
+
+        // The row must only appear once (idempotency prevented double-insert).
+        let count: i64 = writer
+            .conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "idempotency must prevent double-insert");
+    }
+
+    #[test]
+    fn test_idempotency_conflict_different_operations() {
+        let mut writer = make_idempotency_writer();
+
+        let mut req1 = make_write_request(vec![
+            ("INSERT INTO t(val) VALUES (?)", vec![json!("first")]),
+        ]);
+        req1.request_id = "req-conflict-1".to_string();
+        req1.idempotency_key = Some("conflict-key".to_string());
+
+        let resp1 = writer.apply(req1);
+        assert_eq!(resp1.status, crate::request::WriteStatus::Committed);
+
+        // Second request with the same key but different operations → conflict.
+        let mut req2 = make_write_request(vec![
+            ("INSERT INTO t(val) VALUES (?)", vec![json!("different")]),
+        ]);
+        req2.request_id = "req-conflict-2".to_string();
+        req2.idempotency_key = Some("conflict-key".to_string());
+
+        let resp2 = writer.apply(req2);
+        assert_eq!(resp2.status, crate::request::WriteStatus::Failed);
+        let err = resp2.error.expect("error must be set on conflict");
+        assert!(
+            err.contains("idempotency conflict"),
+            "expected 'idempotency conflict' in error, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // §24 latency buffer
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_latency_buffer_records_commits() {
+        let mut writer = make_test_writer();
+        assert_eq!(writer.latency_buf.lock().unwrap().len(), 0);
+
+        let req = make_write_request(vec![
+            ("INSERT INTO t(val) VALUES (?)", vec![json!("lat-test")]),
+        ]);
+        let resp = writer.apply(req);
+        assert_eq!(resp.status, crate::request::WriteStatus::Committed);
+
+        assert_eq!(
+            writer.latency_buf.lock().unwrap().len(),
+            1,
+            "one latency entry must be recorded per successful commit"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // §15 batching — SAVEPOINT isolation unit tests
+    // -----------------------------------------------------------------------
+
+    /// Build a Writer with batch mode enabled (max_size=64) and a test table.
+    /// This allows direct invocation of `apply_batch` without going through
+    /// `Writer::run`, avoiding timing-dependent batch collection.
+    fn make_batch_writer() -> Writer {
+        let conn = Connection::open_in_memory().unwrap();
+        // `run_migrations` is not called here to keep idempotency=false and
+        // avoid squeuelite_commits table creation (track_commits=false).
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT NOT NULL UNIQUE);",
+        )
+        .unwrap();
+
+        let (_, rx) = mpsc::channel(1);
+        let config = GatewayConfig {
+            allow_schema_write: true,
+            batch: Some(crate::config::BatchConfig { max_size: 64, max_delay_micros: 500 }),
+            ..GatewayConfig::default()
+        };
+        let latency_buf = new_latency_buffer();
+        Writer::new(conn, rx, false, false, config, latency_buf)
+    }
+
+    /// §15 core guarantee: when one request in a batch fails (UNIQUE constraint
+    /// violation), its SAVEPOINT is rolled back while the others are committed.
+    #[test]
+    fn test_batch_savepoint_isolation_one_failure_others_committed() {
+        let mut writer = make_batch_writer();
+
+        // Build a batch directly: 3 requests, where req-2 is a duplicate of
+        // req-1 (UNIQUE constraint on `val`), causing req-2 to fail while
+        // req-1 and req-3 must remain committed.
+        //
+        // We call `apply_batch` directly to bypass the run-loop's greedy drain
+        // (which is timing-dependent). This is the correct unit-test approach
+        // for verifying SAVEPOINT isolation without flakiness.
+        let (tx1, mut rx1) = oneshot::channel::<WriteResponse>();
+        let req1 = WriteRequest {
+            request_id: "req-1".to_string(),
+            actor_id: "test-actor".to_string(),
+            run_id: None,
+            idempotency_key: None,
+            operations: vec![crate::request::SqlOperation {
+                sql: "INSERT INTO t(val) VALUES (?)".to_string(),
+                params: vec![json!("apple")],
+            }],
+        };
+
+        let (tx2, mut rx2) = oneshot::channel::<WriteResponse>();
+        let req2 = WriteRequest {
+            request_id: "req-2".to_string(),
+            actor_id: "test-actor".to_string(),
+            run_id: None,
+            idempotency_key: None,
+            operations: vec![crate::request::SqlOperation {
+                // Duplicate value — triggers UNIQUE constraint failure.
+                sql: "INSERT INTO t(val) VALUES (?)".to_string(),
+                params: vec![json!("apple")],
+            }],
+        };
+
+        let (tx3, mut rx3) = oneshot::channel::<WriteResponse>();
+        let req3 = WriteRequest {
+            request_id: "req-3".to_string(),
+            actor_id: "test-actor".to_string(),
+            run_id: None,
+            idempotency_key: None,
+            operations: vec![crate::request::SqlOperation {
+                sql: "INSERT INTO t(val) VALUES (?)".to_string(),
+                params: vec![json!("banana")],
+            }],
+        };
+
+        writer.apply_batch(vec![(req1, tx1), (req2, tx2), (req3, tx3)]);
+
+        // Collect responses (non-blocking — apply_batch is synchronous and
+        // sends before returning).
+        let resp1 = rx1.try_recv().expect("response for req-1 must be sent");
+        let resp2 = rx2.try_recv().expect("response for req-2 must be sent");
+        let resp3 = rx3.try_recv().expect("response for req-3 must be sent");
+
+        assert_eq!(
+            resp1.status,
+            crate::request::WriteStatus::Committed,
+            "req-1 (first INSERT) must be Committed"
+        );
+        assert_eq!(
+            resp2.status,
+            crate::request::WriteStatus::Failed,
+            "req-2 (duplicate UNIQUE) must be Failed"
+        );
+        assert_eq!(
+            resp3.status,
+            crate::request::WriteStatus::Committed,
+            "req-3 must be Committed — req-2's failure must not affect it (§15 SAVEPOINT isolation)"
+        );
+
+        // Verify that the database reflects the expected state:
+        // req-1 and req-3 committed; req-2 rolled back.
+        let count: i64 = writer
+            .conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "exactly 2 rows must exist after the batch (req-1 and req-3)");
+
+        let vals: Vec<String> = {
+            let mut stmt = writer.conn.prepare("SELECT val FROM t ORDER BY val").unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(vals, vec!["apple", "banana"], "only 'apple' and 'banana' must be present");
+    }
+
+    /// §10/§23 — validate_sql must be applied in the batch path as well.
+    /// A batch containing a forbidden SQL statement (BEGIN) must fail that
+    /// individual request while committing others.
+    #[test]
+    fn test_batch_validate_sql_applied_for_each_request() {
+        let mut writer = make_batch_writer();
+
+        let (tx1, mut rx1) = oneshot::channel::<WriteResponse>();
+        let req1 = WriteRequest {
+            request_id: "req-valid".to_string(),
+            actor_id: "test-actor".to_string(),
+            run_id: None,
+            idempotency_key: None,
+            operations: vec![crate::request::SqlOperation {
+                sql: "INSERT INTO t(val) VALUES (?)".to_string(),
+                params: vec![json!("ok")],
+            }],
+        };
+
+        let (tx2, mut rx2) = oneshot::channel::<WriteResponse>();
+        let req2 = WriteRequest {
+            request_id: "req-forbidden".to_string(),
+            actor_id: "test-actor".to_string(),
+            run_id: None,
+            idempotency_key: None,
+            operations: vec![crate::request::SqlOperation {
+                // BEGIN is forbidden (§10 transaction control keywords).
+                sql: "BEGIN".to_string(),
+                params: vec![],
+            }],
+        };
+
+        writer.apply_batch(vec![(req1, tx1), (req2, tx2)]);
+
+        let resp1 = rx1.try_recv().expect("response for req-valid must be sent");
+        let resp2 = rx2.try_recv().expect("response for req-forbidden must be sent");
+
+        assert_eq!(
+            resp1.status,
+            crate::request::WriteStatus::Committed,
+            "req-valid must be Committed"
+        );
+        assert_eq!(
+            resp2.status,
+            crate::request::WriteStatus::Failed,
+            "req-forbidden (BEGIN keyword) must be Failed due to validate_sql (§10/§23)"
+        );
+        assert!(
+            resp2.error.as_deref().unwrap_or("").contains("forbidden keyword"),
+            "error message must mention the forbidden keyword"
+        );
+
+        // The valid request's row must be committed.
+        let count: i64 = writer
+            .conn
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "only the valid request must have inserted a row");
     }
 }

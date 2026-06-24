@@ -25,12 +25,21 @@ fn temp_prefix() -> String {
 ///
 /// Returns `(socket_path, db_path, shutdown_notify)`.
 /// Call `shutdown_notify.notify_one()` to trigger graceful shutdown.
+///
+/// `allow_schema_write` is set to `true` so that tests can CREATE tables via
+/// the write channel without being rejected by the §23 security filter.
 async fn start_gateway() -> (PathBuf, PathBuf, Arc<Notify>) {
     let prefix = temp_prefix();
     let db_path = PathBuf::from(format!("{prefix}.db"));
     let socket_path = PathBuf::from(format!("{prefix}.sock"));
 
-    let config = SidecarConfig::new(&db_path, &socket_path);
+    let mut gateway_config = squeuelite::GatewayConfig::new(&db_path);
+    // §23: allow_schema_write=true so integration tests can CREATE tables.
+    gateway_config.allow_schema_write = true;
+    let config = SidecarConfig {
+        gateway: gateway_config,
+        socket_path: socket_path.clone(),
+    };
     let gateway = SidecarGateway::open(config).expect("open gateway");
 
     let notify = Arc::new(Notify::new());

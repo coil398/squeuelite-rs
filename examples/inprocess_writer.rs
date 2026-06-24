@@ -8,7 +8,13 @@
 #[tokio::main]
 async fn main() -> squeuelite::Result<()> {
     // Open an in-memory gateway (no file left on disk). §21
-    let gateway = squeuelite::InProcessGateway::open(":memory:")?;
+    // allow_schema_write=true so this example can CREATE the events table via
+    // the write channel (§23 default is false; examples are trusted callers).
+    let config = squeuelite::GatewayConfig {
+        allow_schema_write: true,
+        ..squeuelite::GatewayConfig::new(":memory:")
+    };
+    let gateway = squeuelite::InProcessGateway::open_with_config(config)?;
     let handle = gateway.handle();
 
     // --- Setup: create a simple events table via the gateway ---

@@ -325,10 +325,13 @@ async fn dispatch_line(
             }
         }
         Incoming::Admin(AdminCommand::Stats) => {
+            let (avg_latency, p95_latency) = handle.latency_snapshot();
             let snapshot = stats.snapshot(
                 handle.queue_depth(),
                 handle.queue_capacity(),
                 wal_size_bytes(db_path),
+                avg_latency,
+                p95_latency,
             );
             serde_json::to_string(&snapshot)
                 .unwrap_or_else(|e| format!(r#"{{"error":"serialize error: {e}"}}"#))

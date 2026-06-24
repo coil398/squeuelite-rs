@@ -6,9 +6,6 @@
 //! counters that are safe to share across async tasks. A `StatsSnapshot`
 //! can be requested at any time via the admin `{ "type": "stats" }` command
 //! (§24 JSON Lines admin interface).
-//!
-//! **Not included (future work)**: avg/p95 commit latency. These require
-//! a sliding-window histogram and go beyond "basic" stats for the MVP (§27).
 
 use std::sync::{
     Arc,
@@ -48,12 +45,16 @@ impl Stats {
     /// `queue_depth` and `queue_capacity` come from the `GatewayHandle`
     /// channel introspection (§14 backpressure). `current_wal_size_bytes`
     /// is fetched best-effort from the filesystem (None for `:memory:` or
-    /// when WAL is disabled).
+    /// when WAL is disabled). `avg_commit_latency_micros` and
+    /// `p95_commit_latency_micros` come from the shared latency ring buffer
+    /// via [`crate::inprocess::GatewayHandle::latency_snapshot`] (§24).
     pub(crate) fn snapshot(
         &self,
         queue_depth: usize,
         queue_capacity: usize,
         current_wal_size_bytes: Option<u64>,
+        avg_commit_latency_micros: f64,
+        p95_commit_latency_micros: u64,
     ) -> StatsSnapshot {
         StatsSnapshot {
             accepted: self.accepted.load(Ordering::Relaxed),
@@ -63,6 +64,8 @@ impl Stats {
             queue_depth,
             queue_capacity,
             current_wal_size_bytes,
+            avg_commit_latency_micros,
+            p95_commit_latency_micros,
         }
     }
 }
@@ -91,6 +94,14 @@ pub struct StatsSnapshot {
     pub queue_capacity: usize,
     /// Size of the WAL file in bytes, or `None` for `:memory:` / no WAL (§16).
     pub current_wal_size_bytes: Option<u64>,
+    /// Average commit latency in microseconds over the last 1024 commits (§24).
+    ///
+    /// `0.0` when no commits have been recorded yet.
+    pub avg_commit_latency_micros: f64,
+    /// 95th percentile commit latency in microseconds over the last 1024 commits (§24).
+    ///
+    /// `0` when no commits have been recorded yet.
+    pub p95_commit_latency_micros: u64,
 }
 
 // ---------------------------------------------------------------------------

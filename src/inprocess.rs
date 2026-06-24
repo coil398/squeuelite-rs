@@ -11,7 +11,7 @@ use crate::{
     config::GatewayConfig,
     error::{Error, Result},
     request::{WriteRequest, WriteResponse},
-    writer::{Command, Writer, apply_pragmas, run_migrations},
+    writer::{Command, LatencyBuffer, Writer, apply_pragmas, new_latency_buffer, run_migrations},
 };
 
 // ---------------------------------------------------------------------------
@@ -41,6 +41,7 @@ pub struct InProcessGateway {
     sender: mpsc::Sender<Command>,
     writer_handle: Option<thread::JoinHandle<()>>,
     db_path: std::path::PathBuf,
+    latency_buf: LatencyBuffer,
 }
 
 impl InProcessGateway {
@@ -67,23 +68,31 @@ impl InProcessGateway {
         apply_pragmas(&conn, &config)?;
 
         // Step 3 — create internal tables (no-op when track_commits=false).
-        run_migrations(&conn, config.track_commits)?;
+        // Startup migration runs on the writer Connection directly and is NOT
+        // subject to the validate_sql security checks (§23 note in run_migrations).
+        run_migrations(&conn, config.track_commits, config.idempotency)?;
 
-        // Step 4 — bounded channel (§14) and writer thread.
+        // Step 4 — bounded channel (§14), latency buffer (§24), and writer thread.
         let (tx, rx) = mpsc::channel::<Command>(config.queue_capacity);
 
+        let latency_buf = new_latency_buffer();
+        let latency_buf_writer = latency_buf.clone();
+
         let track_commits = config.track_commits;
+        let idempotency = config.idempotency;
+        let config_clone = config.clone();
         let handle = thread::spawn(move || {
             // Connection is Send but !Sync; moving it into the thread is the
             // only safe pattern (Arc<Mutex<Connection>> risks deadlock because
             // rusqlite's internal locking interacts poorly with external locking).
-            Writer::new(conn, rx, track_commits).run();
+            Writer::new(conn, rx, track_commits, idempotency, config_clone, latency_buf_writer).run();
         });
 
         Ok(Self {
             sender: tx,
             writer_handle: Some(handle),
             db_path: config.db_path,
+            latency_buf,
         })
     }
 
@@ -92,6 +101,7 @@ impl InProcessGateway {
     pub fn handle(&self) -> GatewayHandle {
         GatewayHandle {
             sender: self.sender.clone(),
+            latency_buf: self.latency_buf.clone(),
         }
     }
 
@@ -165,6 +175,7 @@ impl Drop for InProcessGateway {
 #[derive(Clone)]
 pub struct GatewayHandle {
     sender: mpsc::Sender<Command>,
+    latency_buf: LatencyBuffer,
 }
 
 impl GatewayHandle {
@@ -214,6 +225,34 @@ impl GatewayHandle {
 
         rx.await.map_err(|_| Error::GatewayClosed)?
     }
+
+    /// Compute avg and p95 commit latency from the shared ring buffer (§24).
+    ///
+    /// Returns `(avg_micros, p95_micros)`. Both are `0` when no commits have
+    /// been recorded yet (empty buffer).
+    ///
+    /// `p95` is computed by sorting a snapshot of the buffer and taking the
+    /// element at the 95th percentile index.
+    pub fn latency_snapshot(&self) -> (f64, u64) {
+        let guard = match self.latency_buf.lock() {
+            Ok(g) => g,
+            Err(_) => return (0.0, 0),
+        };
+        if guard.is_empty() {
+            return (0.0, 0);
+        }
+
+        let sum: u64 = guard.iter().sum();
+        let avg = sum as f64 / guard.len() as f64;
+
+        // p95: copy, sort, index at ⌈0.95 * N⌉ - 1 (0-indexed).
+        let mut sorted: Vec<u64> = guard.iter().copied().collect();
+        sorted.sort_unstable();
+        let p95_idx = ((sorted.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
+        let p95 = sorted[p95_idx];
+
+        (avg, p95)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +287,8 @@ mod tests {
     async fn open_memory_gateway(track_commits: bool) -> InProcessGateway {
         let mut config = GatewayConfig::new(":memory:");
         config.track_commits = track_commits;
+        // Tests need to CREATE tables via execute(); allow_schema_write must be true.
+        config.allow_schema_write = true;
         InProcessGateway::open_with_config(config).unwrap()
     }
 
@@ -524,6 +565,224 @@ mod tests {
             "params conversion should succeed; error: {:?}",
             resp.error
         );
+
+        gw.shutdown().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7: §23 security — schema write rejected by default
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_schema_write_rejected_by_default() {
+        // Default config has allow_schema_write=false.
+        let config = GatewayConfig::new(":memory:");
+        let gw = InProcessGateway::open_with_config(config).unwrap();
+        let handle = gw.handle();
+
+        let req = make_request(
+            "req-create",
+            vec![sql_op(
+                "CREATE TABLE should_fail (id INTEGER PRIMARY KEY)",
+                vec![],
+            )],
+        );
+        let resp = handle.execute(req).await.unwrap();
+        assert_eq!(
+            resp.status,
+            WriteStatus::Failed,
+            "CREATE must be rejected when allow_schema_write=false"
+        );
+        let err = resp.error.expect("error must be set");
+        assert!(
+            err.contains("sql rejected"),
+            "expected 'sql rejected', got: {err}"
+        );
+
+        gw.shutdown().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 8: §23 security — DROP rejected by default
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_drop_rejected_by_default() {
+        // allow_drop=false by default.
+        let config = GatewayConfig {
+            allow_schema_write: true, // allow CREATE to set up the table
+            ..GatewayConfig::new(":memory:")
+        };
+        let gw = InProcessGateway::open_with_config(config).unwrap();
+        let handle = gw.handle();
+
+        // Create a table first (allow_schema_write=true).
+        let setup = make_request(
+            "setup",
+            vec![sql_op("CREATE TABLE drop_test (id INTEGER PRIMARY KEY)", vec![])],
+        );
+        handle.execute(setup).await.unwrap();
+
+        // DROP must be rejected (allow_drop=false by default).
+        let req = make_request(
+            "req-drop",
+            vec![sql_op("DROP TABLE drop_test", vec![])],
+        );
+        let resp = handle.execute(req).await.unwrap();
+        assert_eq!(
+            resp.status,
+            WriteStatus::Failed,
+            "DROP must be rejected when allow_drop=false"
+        );
+        let err = resp.error.expect("error must be set");
+        assert!(
+            err.contains("sql rejected"),
+            "expected 'sql rejected', got: {err}"
+        );
+
+        gw.shutdown().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 9: §23 security — DELETE rejected when allow_delete=false
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_delete_rejected_when_disabled() {
+        let config = GatewayConfig {
+            allow_schema_write: true,
+            allow_delete: false,
+            ..GatewayConfig::new(":memory:")
+        };
+        let gw = InProcessGateway::open_with_config(config).unwrap();
+        let handle = gw.handle();
+
+        // Create and populate a table.
+        let setup = make_request(
+            "setup",
+            vec![sql_op(
+                "CREATE TABLE del_test (id INTEGER PRIMARY KEY, val TEXT NOT NULL)",
+                vec![],
+            )],
+        );
+        handle.execute(setup).await.unwrap();
+
+        let insert = make_request(
+            "insert",
+            vec![sql_op("INSERT INTO del_test(val) VALUES ('row')", vec![])],
+        );
+        handle.execute(insert).await.unwrap();
+
+        // DELETE must be rejected.
+        let req = make_request(
+            "req-delete",
+            vec![sql_op("DELETE FROM del_test", vec![])],
+        );
+        let resp = handle.execute(req).await.unwrap();
+        assert_eq!(
+            resp.status,
+            WriteStatus::Failed,
+            "DELETE must be rejected when allow_delete=false"
+        );
+        let err = resp.error.expect("error must be set");
+        assert!(
+            err.contains("sql rejected"),
+            "expected 'sql rejected', got: {err}"
+        );
+
+        gw.shutdown().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 10: §13 idempotency — end-to-end via GatewayHandle
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_idempotency_end_to_end() {
+        let config = GatewayConfig {
+            allow_schema_write: true,
+            idempotency: true,
+            track_commits: true,
+            ..GatewayConfig::new(":memory:")
+        };
+        let gw = InProcessGateway::open_with_config(config).unwrap();
+        let handle = gw.handle();
+
+        // Setup table.
+        let setup = make_request(
+            "setup",
+            vec![sql_op(
+                "CREATE TABLE idem_test (id INTEGER PRIMARY KEY, val TEXT NOT NULL UNIQUE)",
+                vec![],
+            )],
+        );
+        handle.execute(setup).await.unwrap();
+
+        // First call: new idempotency key.
+        let mut req = make_request(
+            "req-idem",
+            vec![sql_op(
+                "INSERT INTO idem_test(val) VALUES (?)",
+                vec![serde_json::json!("only-once")],
+            )],
+        );
+        req.idempotency_key = Some("idem-key-1".to_string());
+        let resp1 = handle.execute(req.clone()).await.unwrap();
+        assert_eq!(resp1.status, WriteStatus::Committed);
+
+        // Second call: same key and same operations → returns stored response.
+        let resp2 = handle.execute(req.clone()).await.unwrap();
+        assert_eq!(resp2.status, WriteStatus::Committed,
+            "second call with same idempotency_key must return Committed");
+
+        // Verify no double-insert (UNIQUE constraint would catch it if there was one).
+        // We rely on the fact that the second call should not have inserted again.
+        // Use a DELETE-like probe: if two rows existed, count would be 2.
+        // We can't SELECT directly, so we insert a conflicting value to probe.
+        let mut probe = make_request(
+            "probe",
+            vec![sql_op(
+                "INSERT INTO idem_test(val) VALUES (?)",
+                vec![serde_json::json!("only-once")],
+            )],
+        );
+        // No idempotency key on probe — will try to INSERT the same value.
+        probe.request_id = "probe-unique".to_string();
+        let probe_resp = handle.execute(probe).await.unwrap();
+        // If "only-once" was inserted twice, UNIQUE would have caught it on the
+        // second idempotency call and the table would still have exactly one row.
+        // This INSERT should fail because of the UNIQUE constraint.
+        assert_eq!(
+            probe_resp.status,
+            WriteStatus::Failed,
+            "duplicate UNIQUE value must still exist (idempotency prevented double-insert)"
+        );
+
+        gw.shutdown().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 11: §24 latency_snapshot via GatewayHandle
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_latency_snapshot_after_commits() {
+        let gw = open_memory_gateway(false).await;
+        let handle = gw.handle();
+
+        // Before any commits, latency should be zero.
+        let (avg, p95) = handle.latency_snapshot();
+        assert_eq!(avg, 0.0);
+        assert_eq!(p95, 0);
+
+        create_test_table(&handle).await;
+
+        // After at least one commit, the latency buffer must have recorded an
+        // entry. avg > 0.0 proves the buffer is non-empty and the value was
+        // actually measured (not just a default zero).
+        let (avg_after, p95_after) = handle.latency_snapshot();
+        assert!(avg_after > 0.0, "avg must be positive after a commit (latency buffer must be non-empty)");
+        assert!(p95_after >= p95, "p95 must be non-decreasing");
 
         gw.shutdown().await.unwrap();
     }

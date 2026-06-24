@@ -30,6 +30,85 @@ pub struct GatewayConfig {
     /// Whether to enforce `PRAGMA foreign_keys = ON` (§16). Defaults to
     /// `true`.
     pub foreign_keys: bool,
+
+    // -----------------------------------------------------------------------
+    // §13 Idempotency
+    // -----------------------------------------------------------------------
+
+    /// When `true` (the default), the gateway creates the `squeuelite_requests`
+    /// table at startup and deduplicates writes by `idempotency_key` (§13).
+    ///
+    /// Set to `false` to skip idempotency tracking (e.g. for maximum-throughput
+    /// scenarios where callers never retry). When `false`, any `idempotency_key`
+    /// in a [`crate::request::WriteRequest`] is silently ignored.
+    pub idempotency: bool,
+
+    // -----------------------------------------------------------------------
+    // §23 Security / Safety
+    // -----------------------------------------------------------------------
+
+    /// When `true` (the default), raw SQL via [`crate::request::SqlOperation`]
+    /// is allowed. When `false`, **all** write operations are rejected because
+    /// the MVP only supports raw SQL (§10). Future versions will add typed
+    /// operations that can bypass this flag (§10 future extension). A comment
+    /// is placed at the rejection site in `validate_sql`.
+    pub allow_raw_sql: bool,
+
+    /// When `true`, `CREATE`, `ALTER`, `DROP`, and `TRUNCATE` statements are
+    /// allowed. Defaults to `false` (§23). Startup migration uses a direct
+    /// connection that bypasses this flag; user-supplied SQL is subject to it.
+    pub allow_schema_write: bool,
+
+    /// When `true` (the default), `DELETE` statements are allowed (§23).
+    /// Set to `false` to prevent callers from deleting rows.
+    pub allow_delete: bool,
+
+    /// When `true`, `DROP` statements are allowed. Defaults to `false` (§23).
+    /// Note: `DROP` is also a schema-write operation; both `allow_schema_write`
+    /// and `allow_drop` must be `true` to issue `DROP TABLE` etc.
+    pub allow_drop: bool,
+
+    // -----------------------------------------------------------------------
+    // §15 Batching
+    // -----------------------------------------------------------------------
+
+    /// Optional batch commit configuration (§15). Defaults to `None` (disabled).
+    ///
+    /// When `None`, each request is processed as an independent transaction
+    /// (the MVP default, preferred for latency-sensitive workloads).
+    /// When `Some(batch_config)`, the writer collects multiple single-op
+    /// requests arriving in the same scheduling quantum and commits them in
+    /// one outer transaction using SAVEPOINTs for per-request isolation.
+    pub batch: Option<BatchConfig>,
+}
+
+/// Configuration for the optional batch-commit optimisation (§15).
+///
+/// The writer drains the queue greedily after receiving the first request.
+/// At most `max_size` requests are bundled per batch. Because the writer
+/// uses `try_recv` (non-blocking), the effective delay is bounded by the
+/// OS scheduler's wakeup latency rather than `max_delay_micros`; the field
+/// is retained for API symmetry with the design spec but is not enforced
+/// as a hard timer in the MVP batch implementation (§15 notes this is
+/// acceptable for "greedy short-duration collection").
+#[derive(Debug, Clone)]
+pub struct BatchConfig {
+    /// Maximum number of requests to bundle into one outer transaction (§15).
+    /// Defaults to `64` (§15 `max_batch_size = 64`).
+    pub max_size: usize,
+    /// Maximum delay target in microseconds before committing a partial batch
+    /// (§15 `max_batch_delay_micros = 500`). See struct-level note on MVP
+    /// simplification.
+    pub max_delay_micros: u64,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            max_size: 64,
+            max_delay_micros: 500,
+        }
+    }
 }
 
 impl GatewayConfig {
@@ -56,6 +135,15 @@ impl Default for GatewayConfig {
             track_commits: true,
             busy_timeout_ms: 5000,
             foreign_keys: true,
+            // §13 — idempotency enabled by default.
+            idempotency: true,
+            // §23 — default values from the design specification.
+            allow_raw_sql: true,
+            allow_schema_write: false,
+            allow_delete: true,
+            allow_drop: false,
+            // §15 — batching disabled by default (latency-first default).
+            batch: None,
         }
     }
 }

@@ -30,6 +30,12 @@ pub enum Error {
     #[error("gateway is closed")]
     GatewayClosed,
 
+    /// An idempotency key conflict: the same key was used with a different
+    /// request hash (different operations), indicating a likely programming error
+    /// in the caller (§13).
+    #[error("idempotency conflict: key '{0}' already used with a different request hash")]
+    IdempotencyConflict(String),
+
     /// An I/O error when reading from or writing to a Unix Domain Socket
     /// (sidecar mode, §18).
     #[error("io error: {0}")]
