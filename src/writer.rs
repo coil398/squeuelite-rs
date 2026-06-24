@@ -279,15 +279,23 @@ impl Writer {
                 };
 
                 // Read-only query — no transaction needed.
-                match self.conn.query_row(
-                    "SELECT request_hash, response_json FROM squeuelite_requests WHERE idempotency_key = ?1",
-                    rusqlite::params![key],
-                    |row| {
-                        let stored_hash: String = row.get(0)?;
-                        let response_json: Option<String> = row.get(1)?;
-                        Ok((stored_hash, response_json))
-                    },
-                ) {
+                // §25 — prepare_cached: this SELECT runs once per request that
+                // carries an idempotency_key, so caching the prepared plan is
+                // worthwhile for high-throughput idempotency scenarios.
+                let idem_lookup = self
+                    .conn
+                    .prepare_cached(
+                        "SELECT request_hash, response_json \
+                         FROM squeuelite_requests WHERE idempotency_key = ?1",
+                    )
+                    .and_then(|mut stmt| {
+                        stmt.query_row(rusqlite::params![key], |row| {
+                            let stored_hash: String = row.get(0)?;
+                            let response_json: Option<String> = row.get(1)?;
+                            Ok((stored_hash, response_json))
+                        })
+                    });
+                match idem_lookup {
                     Ok((stored_hash, response_json)) => {
                         // Row exists.
                         if stored_hash == request_hash {
@@ -347,12 +355,18 @@ impl Writer {
             // A production implementation would include this INSERT inside the same
             // transaction as the write ops. For the MVP the simple two-phase approach
             // is sufficient.
-            let _ = self.conn.execute(
-                "INSERT OR IGNORE INTO squeuelite_requests \
-                 (idempotency_key, request_hash, status, response_json, commit_seq) \
-                 VALUES (?1, ?2, 'committed', ?3, ?4)",
-                rusqlite::params![key, request_hash, response_json, commit_seq],
-            );
+            // §25 — prepare_cached for the fixed idempotency INSERT (called on
+            // every successful commit with a new idempotency key).
+            let _ = self
+                .conn
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO squeuelite_requests \
+                     (idempotency_key, request_hash, status, response_json, commit_seq) \
+                     VALUES (?1, ?2, 'committed', ?3, ?4)",
+                )
+                .and_then(|mut stmt| {
+                    stmt.execute(rusqlite::params![key, request_hash, response_json, commit_seq])
+                });
         }
 
         response
@@ -377,26 +391,38 @@ impl Writer {
         };
 
         // Execute each operation.
+        // §25 — use `prepare_cached` so the compiled statement plan is reused
+        // across transactions on the same Connection. The statement cache lives
+        // on the Connection (not on the Transaction), so it survives COMMIT /
+        // ROLLBACK and is effective for high-frequency repeated SQL patterns.
         for op in &request.operations {
             let params = match params_from(&op.params) {
                 Ok(p) => p,
                 Err(e) => return WriteResponse::failed(req_id, e.to_string()),
             };
-            if let Err(e) = tx.execute(&op.sql, rusqlite::params_from_iter(params.iter())) {
+            let mut stmt = match tx.prepare_cached(&op.sql) {
+                Ok(s) => s,
+                Err(e) => return WriteResponse::failed(req_id, e.to_string()),
+            };
+            if let Err(e) = stmt.execute(rusqlite::params_from_iter(params.iter())) {
                 return WriteResponse::failed(req_id, e.to_string());
             }
         }
 
         // §12 — record commit.
+        // §25 — prepare_cached for the fixed internal INSERT (high call frequency).
         let commit_seq: Option<i64> = if self.track_commits {
-            let insert_result = tx.execute(
+            let mut stmt = match tx.prepare_cached(
                 "INSERT INTO squeuelite_commits(request_id, actor_id, run_id) VALUES (?, ?, ?)",
-                rusqlite::params![
-                    request.request_id,
-                    request.actor_id,
-                    request.run_id,
-                ],
-            );
+            ) {
+                Ok(s) => s,
+                Err(e) => return WriteResponse::failed(req_id, e.to_string()),
+            };
+            let insert_result = stmt.execute(rusqlite::params![
+                request.request_id,
+                request.actor_id,
+                request.run_id,
+            ]);
             match insert_result {
                 Ok(_) => Some(tx.last_insert_rowid()),
                 Err(e) => return WriteResponse::failed(req_id, e.to_string()),
@@ -497,15 +523,20 @@ impl Writer {
                         }
                     };
 
-                    match tx.query_row(
-                        "SELECT request_hash, response_json FROM squeuelite_requests WHERE idempotency_key = ?1",
-                        rusqlite::params![key],
-                        |row| {
-                            let h: String = row.get(0)?;
-                            let r: Option<String> = row.get(1)?;
-                            Ok((h, r))
-                        },
-                    ) {
+                    // §25 — use the prepared-statement cache for the idempotency
+                    // lookup, consistent with the non-batch write paths.
+                    let lookup = tx
+                        .prepare_cached(
+                            "SELECT request_hash, response_json FROM squeuelite_requests WHERE idempotency_key = ?1",
+                        )
+                        .and_then(|mut stmt| {
+                            stmt.query_row(rusqlite::params![key], |row| {
+                                let h: String = row.get(0)?;
+                                let r: Option<String> = row.get(1)?;
+                                Ok((h, r))
+                            })
+                        });
+                    match lookup {
                         Ok((stored_hash, response_json)) => {
                             if stored_hash == request_hash {
                                 let resp = response_json
@@ -610,22 +641,31 @@ impl Writer {
 
         // Execute each operation (batch only admits single-op requests, but
         // the function is general to handle future changes).
+        // §25 — prepare_cached reuses compiled statement plans across savepoints.
         for op in &request.operations {
             let params = match params_from(&op.params) {
                 Ok(p) => p,
                 Err(e) => sp_fail!(e),
             };
-            if let Err(e) = tx.execute(&op.sql, rusqlite::params_from_iter(params.iter())) {
+            let mut stmt = match tx.prepare_cached(&op.sql) {
+                Ok(s) => s,
+                Err(e) => sp_fail!(e),
+            };
+            if let Err(e) = stmt.execute(rusqlite::params_from_iter(params.iter())) {
                 sp_fail!(e);
             }
         }
 
         // §12 — commit tracking.
+        // §25 — prepare_cached for the fixed internal INSERT.
         let commit_seq: Option<i64> = if track_commits {
-            match tx.execute(
+            let mut stmt = match tx.prepare_cached(
                 "INSERT INTO squeuelite_commits(request_id, actor_id, run_id) VALUES (?, ?, ?)",
-                rusqlite::params![request.request_id, request.actor_id, request.run_id],
             ) {
+                Ok(s) => s,
+                Err(e) => sp_fail!(e),
+            };
+            match stmt.execute(rusqlite::params![request.request_id, request.actor_id, request.run_id]) {
                 Ok(_) => Some(tx.last_insert_rowid()),
                 Err(e) => sp_fail!(e),
             }
@@ -634,15 +674,19 @@ impl Writer {
         };
 
         // §13 — idempotency record (if requested).
+        // §25 — prepare_cached for the fixed internal INSERT OR IGNORE.
         if let Some((key, hash)) = idempotency_record {
             let resp_preview = WriteResponse::committed(req_id.clone(), commit_seq);
             let response_json = serde_json::to_string(&resp_preview).unwrap_or_default();
-            if let Err(e) = tx.execute(
+            let mut stmt = match tx.prepare_cached(
                 "INSERT OR IGNORE INTO squeuelite_requests \
                  (idempotency_key, request_hash, status, response_json, commit_seq) \
                  VALUES (?1, ?2, 'committed', ?3, ?4)",
-                rusqlite::params![key, hash, response_json, commit_seq],
             ) {
+                Ok(s) => s,
+                Err(e) => sp_fail!(e),
+            };
+            if let Err(e) = stmt.execute(rusqlite::params![key, hash, response_json, commit_seq]) {
                 sp_fail!(e);
             }
         }

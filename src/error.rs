@@ -30,6 +30,15 @@ pub enum Error {
     #[error("gateway is closed")]
     GatewayClosed,
 
+    /// The bounded channel was full and the [`crate::config::OverflowPolicy`]
+    /// dictated an immediate rejection or a timeout (§14 Backpressure).
+    ///
+    /// The caller should back off and retry.
+    ///
+    /// JSON representation: `{"status":"failed","error":"gateway overloaded"}`.
+    #[error("gateway overloaded")]
+    GatewayOverloaded,
+
     /// An idempotency key conflict: the same key was used with a different
     /// request hash (different operations), indicating a likely programming error
     /// in the caller (§13).

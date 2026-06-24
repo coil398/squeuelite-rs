@@ -75,7 +75,7 @@ pub mod client;
 // Re-exports
 // ---------------------------------------------------------------------------
 
-pub use config::{GatewayConfig, JournalMode, SyncMode};
+pub use config::{GatewayConfig, JournalMode, OverflowPolicy, SyncMode};
 pub use error::{Error, Result};
 pub use request::{SqlOperation, WriteRequest, WriteResponse, WriteStatus};
 

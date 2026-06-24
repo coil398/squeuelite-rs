@@ -69,6 +69,17 @@ pub struct GatewayConfig {
     pub allow_drop: bool,
 
     // -----------------------------------------------------------------------
+    // §14 Backpressure
+    // -----------------------------------------------------------------------
+
+    /// Behaviour when the bounded mpsc channel is full (§14).
+    ///
+    /// Defaults to [`OverflowPolicy::WaitTimeout`] with a 5000 ms timeout,
+    /// matching the `busy_timeout_ms` default so that the caller gets a prompt
+    /// `GatewayOverloaded` error rather than hanging indefinitely.
+    pub overflow: OverflowPolicy,
+
+    // -----------------------------------------------------------------------
     // §15 Batching
     // -----------------------------------------------------------------------
 
@@ -80,6 +91,41 @@ pub struct GatewayConfig {
     /// requests arriving in the same scheduling quantum and commits them in
     /// one outer transaction using SAVEPOINTs for per-request isolation.
     pub batch: Option<BatchConfig>,
+}
+
+/// Behaviour of [`GatewayHandle::execute`] when the bounded mpsc channel is
+/// full (§14 Backpressure).
+///
+/// The design spec offers three options:
+/// - **wait** — block until space is available (no timeout).
+/// - **reject with overloaded** — return immediately with
+///   [`crate::error::Error::GatewayOverloaded`].
+/// - **timeout** — wait up to a deadline; if the queue is still full, return
+///   [`crate::error::Error::GatewayOverloaded`].
+///
+/// The default is [`OverflowPolicy::WaitTimeout`] with 5000 ms, which matches
+/// the `busy_timeout_ms` default and ensures callers get a deterministic error
+/// rather than blocking forever under load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverflowPolicy {
+    /// Block until a slot opens in the queue (no timeout).
+    ///
+    /// Equivalent to `tokio::sync::mpsc::Sender::send().await` with no timeout.
+    /// Use when callers can tolerate indefinite backpressure.
+    Wait,
+
+    /// Return [`crate::error::Error::GatewayOverloaded`] immediately if the
+    /// queue is full.
+    ///
+    /// Equivalent to `tokio::sync::mpsc::Sender::try_send()` (non-blocking).
+    Reject,
+
+    /// Wait up to `millis` milliseconds for a slot to open; return
+    /// [`crate::error::Error::GatewayOverloaded`] if the timeout expires.
+    WaitTimeout {
+        /// Timeout in milliseconds.
+        millis: u64,
+    },
 }
 
 /// Configuration for the optional batch-commit optimisation (§15).
@@ -137,6 +183,8 @@ impl Default for GatewayConfig {
             foreign_keys: true,
             // §13 — idempotency enabled by default.
             idempotency: true,
+            // §14 — timeout-based backpressure by default (5000 ms matches busy_timeout_ms).
+            overflow: OverflowPolicy::WaitTimeout { millis: 5000 },
             // §23 — default values from the design specification.
             allow_raw_sql: true,
             allow_schema_write: false,

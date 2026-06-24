@@ -305,12 +305,15 @@ async fn dispatch_line(
                         format!(r#"{{"error":"serialize error: {e}"}}"#)
                     })
                 }
-                Err(crate::error::Error::GatewayClosed) => {
+                Err(
+                    crate::error::Error::GatewayOverloaded
+                    | crate::error::Error::GatewayClosed,
+                ) => {
                     use std::sync::atomic::Ordering;
                     stats.rejected.fetch_add(1, Ordering::Relaxed);
                     serde_json::json!({
                         "status": "failed",
-                        "error": "gateway overloaded or closed"
+                        "error": "gateway overloaded"
                     })
                     .to_string()
                 }

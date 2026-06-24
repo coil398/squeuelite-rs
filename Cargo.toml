@@ -15,9 +15,10 @@ rusqlite = { version = "0.40" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"], optional = true }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time"], optional = true }
 # `rt-multi-thread`: required by `#[tokio::main]` (multi_thread flavor) used in
 # the inprocess_writer example and by `#[tokio::test]`; `rt` alone is insufficient.
+# `time`: required for `tokio::time::timeout` used by `OverflowPolicy::WaitTimeout` (§14).
 uuid = { version = "1", features = ["v7"], optional = true }
 
 [features]

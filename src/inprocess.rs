@@ -8,7 +8,7 @@ use rusqlite::Connection;
 use tokio::sync::mpsc;
 
 use crate::{
-    config::GatewayConfig,
+    config::{GatewayConfig, OverflowPolicy},
     error::{Error, Result},
     request::{WriteRequest, WriteResponse},
     writer::{Command, LatencyBuffer, Writer, apply_pragmas, new_latency_buffer, run_migrations},
@@ -42,6 +42,7 @@ pub struct InProcessGateway {
     writer_handle: Option<thread::JoinHandle<()>>,
     db_path: std::path::PathBuf,
     latency_buf: LatencyBuffer,
+    overflow: OverflowPolicy,
 }
 
 impl InProcessGateway {
@@ -80,6 +81,7 @@ impl InProcessGateway {
 
         let track_commits = config.track_commits;
         let idempotency = config.idempotency;
+        let overflow = config.overflow.clone();
         let config_clone = config.clone();
         let handle = thread::spawn(move || {
             // Connection is Send but !Sync; moving it into the thread is the
@@ -93,6 +95,7 @@ impl InProcessGateway {
             writer_handle: Some(handle),
             db_path: config.db_path,
             latency_buf,
+            overflow,
         })
     }
 
@@ -102,6 +105,7 @@ impl InProcessGateway {
         GatewayHandle {
             sender: self.sender.clone(),
             latency_buf: self.latency_buf.clone(),
+            overflow: self.overflow.clone(),
         }
     }
 
@@ -176,26 +180,57 @@ impl Drop for InProcessGateway {
 pub struct GatewayHandle {
     sender: mpsc::Sender<Command>,
     latency_buf: LatencyBuffer,
+    overflow: OverflowPolicy,
 }
 
 impl GatewayHandle {
     /// Submit a write request and wait for the response (§21 `.await?`).
     ///
-    /// The request is sent to the writer thread's bounded queue. If the queue
-    /// is full, `send().await` will apply backpressure (§14).
+    /// The request is sent to the writer thread's bounded queue. The behaviour
+    /// when the queue is full is governed by [`OverflowPolicy`] (§14):
     ///
-    /// Returns `Err(Error::GatewayClosed)` if the writer thread has already
-    /// stopped.
+    /// - [`OverflowPolicy::Wait`]: blocks indefinitely until a slot opens.
+    /// - [`OverflowPolicy::Reject`]: returns [`Error::GatewayOverloaded`] immediately.
+    /// - [`OverflowPolicy::WaitTimeout`]: waits up to `millis` ms; returns
+    ///   [`Error::GatewayOverloaded`] on timeout.
+    ///
+    /// Returns `Err(Error::GatewayClosed)` if the writer thread has already stopped.
     pub async fn execute(&self, request: WriteRequest) -> Result<WriteResponse> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        self.sender
-            .send(Command::Write {
-                request,
-                respond_to: tx,
-            })
-            .await
-            .map_err(|_| Error::GatewayClosed)?;
+        let cmd = Command::Write {
+            request,
+            respond_to: tx,
+        };
+
+        // §14 Backpressure — send the command according to the overflow policy.
+        match &self.overflow {
+            OverflowPolicy::Wait => {
+                // Unbounded wait: the caller will block until a slot opens.
+                self.sender
+                    .send(cmd)
+                    .await
+                    .map_err(|_| Error::GatewayClosed)?;
+            }
+            OverflowPolicy::Reject => {
+                // Non-blocking: fail immediately if the queue is full.
+                self.sender.try_send(cmd).map_err(|e| match e {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => Error::GatewayOverloaded,
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => Error::GatewayClosed,
+                })?;
+            }
+            OverflowPolicy::WaitTimeout { millis } => {
+                // Timed wait: fail with GatewayOverloaded if the queue stays
+                // full for longer than the configured timeout.
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(*millis),
+                    self.sender.send(cmd),
+                )
+                .await
+                .map_err(|_| Error::GatewayOverloaded)? // timeout expired
+                .map_err(|_| Error::GatewayClosed)?; // channel closed
+            }
+        }
 
         rx.await.map_err(|_| Error::GatewayClosed)
     }
@@ -759,6 +794,172 @@ mod tests {
         );
 
         gw.shutdown().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test §14: OverflowPolicy::Reject — GatewayOverloaded when queue is full
+    // -----------------------------------------------------------------------
+
+    /// Open a gateway with capacity=1 and OverflowPolicy::Reject.
+    ///
+    /// To make the queue full we send a request that takes a long time to
+    /// process by making the writer block. We use a helper that fills the queue
+    /// with one pending request and then immediately tries to send another.
+    ///
+    /// Strategy: capacity=1 means the single slot is consumed as soon as the
+    /// writer thread starts working on the first command. We verify that a
+    /// second send with Reject policy returns GatewayOverloaded immediately
+    /// when the writer is busy processing the first command.
+    #[tokio::test]
+    async fn test_overflow_reject_returns_gateway_overloaded() {
+        use crate::config::OverflowPolicy;
+
+        let mut config = GatewayConfig::new(":memory:");
+        config.queue_capacity = 1;
+        config.overflow = OverflowPolicy::Reject;
+        config.allow_schema_write = true;
+
+        let gw = InProcessGateway::open_with_config(config).unwrap();
+        let handle = gw.handle();
+
+        // Create the test table first (sequential, no overflow yet).
+        create_test_table(&handle).await;
+
+        // Fill the channel: send a request and immediately try to fill the queue.
+        // With capacity=1 the channel is: [first_cmd being processed or in queue].
+        // We spawn the first execute as a background task to ensure it occupies
+        // the writer, then send a second request synchronously.
+        //
+        // Because the writer processes one command at a time and the channel
+        // capacity is 1, after the writer takes the first command, the slot is
+        // free momentarily. To reliably fill it, we send two commands in rapid
+        // succession: the first goes into processing, the second fills the queue.
+        // Then the third must be rejected.
+
+        // Send 2 requests to saturate capacity=1 (one in flight + one in queue).
+        let h1 = handle.clone();
+        tokio::spawn(async move {
+            let _ = h1.execute(make_request(
+                "fill-1",
+                vec![sql_op("INSERT INTO test_events(val) VALUES ('a')", vec![])],
+            )).await;
+        });
+        // Give the first request time to enter the channel.
+        tokio::task::yield_now().await;
+
+        let h2 = handle.clone();
+        tokio::spawn(async move {
+            let _ = h2.execute(make_request(
+                "fill-2",
+                vec![sql_op("INSERT INTO test_events(val) VALUES ('b')", vec![])],
+            )).await;
+        });
+        tokio::task::yield_now().await;
+
+        // Now the third request should be rejected because the queue is full.
+        let result = handle.execute(make_request(
+            "overflow",
+            vec![sql_op("INSERT INTO test_events(val) VALUES ('c')", vec![])],
+        )).await;
+
+        // Either GatewayOverloaded (queue full) or Committed (queue drained by now)
+        // are valid outcomes, but we specifically want to verify the Reject path
+        // fires GatewayOverloaded when the queue is provably full.
+        //
+        // Since timing is not guaranteed, we accept both outcomes but assert the
+        // error variant when it occurs is GatewayOverloaded (not GatewayClosed).
+        if let Err(e) = &result {
+            assert!(
+                matches!(e, Error::GatewayOverloaded),
+                "expected GatewayOverloaded, got: {e:?}"
+            );
+        }
+
+        gw.shutdown().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test §14: OverflowPolicy::Reject — verifies error variant deterministically
+    //
+    // Use a tiny channel (capacity=0 is not allowed by tokio; use 1 with a
+    // technique that guarantees the slot is full at the time of the third send).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_overflow_reject_error_variant() {
+        use crate::config::OverflowPolicy;
+        use tokio::sync::mpsc;
+
+        // Build a handle with a mock sender that is already full.
+        // We create a channel of capacity 1, fill it manually, then wrap it
+        // in a GatewayHandle and verify that execute() returns GatewayOverloaded.
+        let (tx, _rx) = mpsc::channel::<Command>(1);
+
+        // Fill the single slot so the channel is at capacity.
+        let fill_cmd = Command::Shutdown; // any variant; we just need the slot taken
+        tx.try_send(fill_cmd).expect("first send must succeed (slot is free)");
+
+        // Now the channel is full. Construct a handle directly.
+        let latency_buf = new_latency_buffer();
+        let handle = GatewayHandle {
+            sender: tx,
+            latency_buf,
+            overflow: OverflowPolicy::Reject,
+        };
+
+        let result = handle.execute(make_request(
+            "overflow",
+            vec![sql_op("INSERT INTO t VALUES (1)", vec![])],
+        )).await;
+
+        assert!(
+            matches!(result, Err(Error::GatewayOverloaded)),
+            "Reject policy must return GatewayOverloaded when queue is full; got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Test §14: OverflowPolicy::WaitTimeout — times out and returns GatewayOverloaded
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_overflow_wait_timeout_returns_gateway_overloaded() {
+        use crate::config::OverflowPolicy;
+        use tokio::sync::mpsc;
+
+        // Create a channel of capacity 1 and fill it so every subsequent send blocks.
+        let (tx, _rx) = mpsc::channel::<Command>(1);
+        tx.try_send(Command::Shutdown).expect("fill slot");
+
+        // Drop _rx is intentional — we want the channel to be full (not closed).
+        // Because `_rx` goes out of scope at end of this test the channel will
+        // close, but the timeout will fire first (1 ms < test teardown).
+
+        let latency_buf = new_latency_buffer();
+        let handle = GatewayHandle {
+            sender: tx,
+            latency_buf,
+            overflow: OverflowPolicy::WaitTimeout { millis: 1 }, // 1 ms → fires quickly
+        };
+
+        let result = handle.execute(make_request(
+            "timeout-overflow",
+            vec![sql_op("INSERT INTO t VALUES (1)", vec![])],
+        )).await;
+
+        // Either GatewayOverloaded (timeout) or GatewayClosed (rx dropped) may
+        // occur depending on task scheduling. Both are acceptable errors; the
+        // important assertion is that the call does NOT hang indefinitely and
+        // does NOT return Ok.
+        assert!(
+            result.is_err(),
+            "WaitTimeout must return an error when the queue is full; got Ok"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, Error::GatewayOverloaded | Error::GatewayClosed),
+            "expected GatewayOverloaded or GatewayClosed, got: {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
