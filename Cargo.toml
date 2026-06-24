@@ -1,0 +1,43 @@
+[package]
+name = "squeuelite"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "A single-writer gateway for SQLite-backed agent systems: serializes concurrent writes through one SQLite writer."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/coil398/squeuelite-rs"
+keywords = ["sqlite", "gateway", "writer", "agent", "wal"]
+categories = ["database", "concurrency"]
+readme = "README.md"
+
+[dependencies]
+rusqlite = { version = "0.40" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros"], optional = true }
+# `rt-multi-thread`: required by `#[tokio::main]` (multi_thread flavor) used in
+# the inprocess_writer example and by `#[tokio::test]`; `rt` alone is insufficient.
+uuid = { version = "1", features = ["v7"], optional = true }
+
+[features]
+# `bundled` compiles SQLite from source (SQLite 3.53.x), guaranteeing
+# availability of WAL mode and other features used by the write gateway.
+# It is enabled by default for reliability; opt out with
+# `default-features = false` to link the system SQLite.
+default = ["bundled"]
+bundled = ["rusqlite/bundled"]
+inprocess = ["dep:tokio"]
+# `sidecar` adds the Unix Domain Socket gateway, JSON Lines protocol, and
+# the sidecar Client. Enables `inprocess` (which brings in tokio), plus
+# the tokio net/io-util/signal features required for UDS accept loops (§18).
+sidecar = ["inprocess", "dep:uuid", "tokio/net", "tokio/io-util", "tokio/signal", "tokio/time"]
+
+[[example]]
+name = "inprocess_writer"
+required-features = ["inprocess"]
+
+[[bin]]
+name = "squeuelite-gateway"
+path = "src/bin/squeuelite-gateway.rs"
+required-features = ["sidecar"]

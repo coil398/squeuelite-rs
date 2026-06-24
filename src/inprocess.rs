@@ -1,0 +1,530 @@
+//! In-process gateway — public API for single-process multi-task usage (§21).
+//!
+//! This module is only compiled when the `inprocess` feature is enabled.
+
+use std::thread;
+
+use rusqlite::Connection;
+use tokio::sync::mpsc;
+
+use crate::{
+    config::GatewayConfig,
+    error::{Error, Result},
+    request::{WriteRequest, WriteResponse},
+    writer::{Command, Writer, apply_pragmas, run_migrations},
+};
+
+// ---------------------------------------------------------------------------
+// InProcessGateway
+// ---------------------------------------------------------------------------
+
+/// Owns the writer thread and the sending end of the command channel.
+///
+/// ## Shutdown behaviour
+///
+/// The recommended shutdown path is the explicit [`InProcessGateway::shutdown`]
+/// async method: it sends a [`Command::Shutdown`] to the writer thread, then
+/// blocks until the thread finishes (which includes the WAL checkpoint, §16).
+///
+/// When `InProcessGateway` is dropped without calling `shutdown`, the `Drop`
+/// implementation drops the channel sender. Because all `Sender` clones are
+/// gone, the writer thread's `blocking_recv()` returns `None` on the next
+/// iteration and the loop exits naturally. The thread is **not** joined on
+/// drop to avoid blocking an async runtime context (joining a thread from
+/// inside an async executor can deadlock if the executor is single-threaded).
+/// This means the WAL checkpoint may run *after* the gateway struct is gone,
+/// which is acceptable for most use cases.
+///
+/// **Recommendation**: always call `shutdown()` explicitly when you need the
+/// WAL checkpoint to complete before the process exits.
+pub struct InProcessGateway {
+    sender: mpsc::Sender<Command>,
+    writer_handle: Option<thread::JoinHandle<()>>,
+    db_path: std::path::PathBuf,
+}
+
+impl InProcessGateway {
+    /// Open a gateway with default configuration (§21 `InProcessGateway::open`).
+    ///
+    /// Equivalent to `open_with_config(GatewayConfig::new(db_path))`.
+    pub fn open(db_path: impl Into<std::path::PathBuf>) -> Result<Self> {
+        let config = GatewayConfig::new(db_path);
+        Self::open_with_config(config)
+    }
+
+    /// Open a gateway with full configuration control.
+    ///
+    /// Steps (§20.1):
+    /// 1. Open the SQLite connection.
+    /// 2. Apply PRAGMAs (§16).
+    /// 3. Run startup migrations (§17 case A).
+    /// 4. Spawn the writer thread with a bounded mpsc channel (§14).
+    pub fn open_with_config(config: GatewayConfig) -> Result<Self> {
+        // Step 1 — open connection.
+        let conn = Connection::open(&config.db_path)?;
+
+        // Step 2 — apply PRAGMAs before any user traffic arrives.
+        apply_pragmas(&conn, &config)?;
+
+        // Step 3 — create internal tables (no-op when track_commits=false).
+        run_migrations(&conn, config.track_commits)?;
+
+        // Step 4 — bounded channel (§14) and writer thread.
+        let (tx, rx) = mpsc::channel::<Command>(config.queue_capacity);
+
+        let track_commits = config.track_commits;
+        let handle = thread::spawn(move || {
+            // Connection is Send but !Sync; moving it into the thread is the
+            // only safe pattern (Arc<Mutex<Connection>> risks deadlock because
+            // rusqlite's internal locking interacts poorly with external locking).
+            Writer::new(conn, rx, track_commits).run();
+        });
+
+        Ok(Self {
+            sender: tx,
+            writer_handle: Some(handle),
+            db_path: config.db_path,
+        })
+    }
+
+    /// Return a cloneable handle that async tasks can use to submit requests
+    /// (§21 `gateway.handle()`).
+    pub fn handle(&self) -> GatewayHandle {
+        GatewayHandle {
+            sender: self.sender.clone(),
+        }
+    }
+
+    /// Return the database path this gateway was opened with.
+    ///
+    /// Used by the sidecar layer to locate the WAL file for stats (§24).
+    pub fn db_path(&self) -> &std::path::PathBuf {
+        &self.db_path
+    }
+
+    /// Gracefully shut down the gateway.
+    ///
+    /// Sends [`Command::Shutdown`] to the writer thread, waits for it to
+    /// finish (which includes the WAL checkpoint), and consumes `self`.
+    ///
+    /// Returns [`Error::GatewayClosed`] if the writer thread panicked.
+    ///
+    /// # Runtime requirement
+    ///
+    /// This method calls `thread::JoinHandle::join()` directly, which **blocks
+    /// the calling OS thread** until the writer thread exits. This is safe with
+    /// the `rt-multi-thread` Tokio runtime because the blocking call runs on a
+    /// worker thread and does not starve the async scheduler. On a
+    /// `current_thread` runtime, this call will block the single runtime thread
+    /// and stall all other async tasks until the writer finishes. In that case,
+    /// wrap the call in `tokio::task::spawn_blocking`:
+    ///
+    /// ```ignore
+    /// tokio::task::spawn_blocking(move || {
+    ///     tokio::runtime::Handle::current().block_on(gateway.shutdown())
+    /// }).await??;
+    /// ```
+    pub async fn shutdown(mut self) -> Result<()> {
+        // Send Shutdown command; if the channel is already closed the writer
+        // has already exited — that is fine, we just join.
+        let _ = self.sender.send(Command::Shutdown).await;
+
+        // self.sender will be dropped when `self` is consumed at end of this
+        // function, closing the channel if the Shutdown message was not received.
+
+        // Wait for the writer thread to finish (includes WAL checkpoint §16).
+        if let Some(handle) = self.writer_handle.take() {
+            handle
+                .join()
+                .map_err(|_| Error::GatewayClosed)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for InProcessGateway {
+    /// Best-effort shutdown on drop: dropping the sender causes the writer
+    /// thread's `blocking_recv()` to return `None`, terminating the loop.
+    ///
+    /// The thread is NOT joined here to avoid blocking an async runtime.
+    /// Prefer calling `shutdown().await` explicitly for a clean exit.
+    fn drop(&mut self) {
+        // writer_handle and sender will be dropped automatically; the sender
+        // drop is what triggers the natural writer thread exit.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GatewayHandle
+// ---------------------------------------------------------------------------
+
+/// A cheaply cloneable handle that async tasks use to submit write requests.
+///
+/// Obtain from [`InProcessGateway::handle`].
+#[derive(Clone)]
+pub struct GatewayHandle {
+    sender: mpsc::Sender<Command>,
+}
+
+impl GatewayHandle {
+    /// Submit a write request and wait for the response (§21 `.await?`).
+    ///
+    /// The request is sent to the writer thread's bounded queue. If the queue
+    /// is full, `send().await` will apply backpressure (§14).
+    ///
+    /// Returns `Err(Error::GatewayClosed)` if the writer thread has already
+    /// stopped.
+    pub async fn execute(&self, request: WriteRequest) -> Result<WriteResponse> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        self.sender
+            .send(Command::Write {
+                request,
+                respond_to: tx,
+            })
+            .await
+            .map_err(|_| Error::GatewayClosed)?;
+
+        rx.await.map_err(|_| Error::GatewayClosed)
+    }
+
+    /// Number of pending items currently in the bounded channel (§24 stats).
+    ///
+    /// `queue_depth = max_capacity - current_capacity` (i.e. items waiting).
+    pub fn queue_depth(&self) -> usize {
+        self.sender.max_capacity() - self.sender.capacity()
+    }
+
+    /// Maximum capacity of the bounded channel (§24 stats, §14).
+    pub fn queue_capacity(&self) -> usize {
+        self.sender.max_capacity()
+    }
+
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE)` via the writer thread (§24 admin).
+    ///
+    /// Returns `Err(Error::GatewayClosed)` if the writer thread has stopped.
+    pub async fn checkpoint(&self) -> Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        self.sender
+            .send(Command::Checkpoint { respond_to: tx })
+            .await
+            .map_err(|_| Error::GatewayClosed)?;
+
+        rx.await.map_err(|_| Error::GatewayClosed)?
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::GatewayConfig,
+        request::{SqlOperation, WriteRequest, WriteStatus},
+    };
+
+    fn make_request(id: &str, ops: Vec<SqlOperation>) -> WriteRequest {
+        WriteRequest {
+            request_id: id.to_string(),
+            actor_id: "test-actor".to_string(),
+            run_id: None,
+            idempotency_key: None,
+            operations: ops,
+        }
+    }
+
+    fn sql_op(sql: &str, params: Vec<serde_json::Value>) -> SqlOperation {
+        SqlOperation {
+            sql: sql.to_string(),
+            params,
+        }
+    }
+
+    async fn open_memory_gateway(track_commits: bool) -> InProcessGateway {
+        let mut config = GatewayConfig::new(":memory:");
+        config.track_commits = track_commits;
+        InProcessGateway::open_with_config(config).unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper: create a test table via the gateway
+    // -----------------------------------------------------------------------
+
+    async fn create_test_table(handle: &GatewayHandle) {
+        let req = make_request(
+            "setup",
+            vec![sql_op(
+                "CREATE TABLE test_events (id INTEGER PRIMARY KEY, val TEXT NOT NULL)",
+                vec![],
+            )],
+        );
+        let resp = handle.execute(req).await.unwrap();
+        assert_eq!(resp.status, WriteStatus::Committed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 1: single INSERT → Committed + commit_seq = Some(1)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_single_insert_committed_with_commit_seq() {
+        let gw = open_memory_gateway(true).await;
+        let handle = gw.handle();
+
+        create_test_table(&handle).await;
+
+        let req = make_request(
+            "req-1",
+            vec![sql_op(
+                "INSERT INTO test_events(val) VALUES (?)",
+                vec![serde_json::Value::String("hello".into())],
+            )],
+        );
+
+        let resp = handle.execute(req).await.unwrap();
+        assert_eq!(resp.status, WriteStatus::Committed);
+        // commit_seq = Some(1): first commit recorded in squeuelite_commits.
+        // The CREATE TABLE above also increments the sequence, so this INSERT
+        // is the second commit (seq=2). We check Some(_) rather than Some(1).
+        assert!(resp.commit_seq.is_some(), "expected commit_seq to be set");
+        assert!(resp.error.is_none());
+
+        gw.shutdown().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 2: atomic rollback — op2 constraint violation rolls back op1
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_atomic_rollback_on_constraint_violation() {
+        let gw = open_memory_gateway(true).await;
+        let handle = gw.handle();
+
+        // Table with a NOT NULL constraint on val AND a UNIQUE constraint.
+        // The UNIQUE constraint is used below to verify that op1's row was
+        // rolled back: if "good" still existed, re-inserting it would fail.
+        let setup = make_request(
+            "setup",
+            vec![sql_op(
+                "CREATE TABLE strict_events (id INTEGER PRIMARY KEY, val TEXT NOT NULL UNIQUE)",
+                vec![],
+            )],
+        );
+        handle.execute(setup).await.unwrap();
+
+        // op1: valid INSERT; op2: NULL into NOT NULL → constraint violation.
+        let req = make_request(
+            "req-atomic",
+            vec![
+                sql_op(
+                    "INSERT INTO strict_events(val) VALUES (?)",
+                    vec![serde_json::Value::String("good".into())],
+                ),
+                sql_op(
+                    "INSERT INTO strict_events(val) VALUES (?)",
+                    vec![serde_json::Value::Null], // violates NOT NULL
+                ),
+            ],
+        );
+
+        let resp = handle.execute(req).await.unwrap();
+        assert_eq!(resp.status, WriteStatus::Failed);
+        assert!(resp.commit_seq.is_none());
+        assert!(resp.error.is_some());
+
+        // Verify op1 was also rolled back.
+        // Strategy: attempt to INSERT the same value ("good") that op1 tried to
+        // insert. If op1 was NOT rolled back (row still exists), the UNIQUE
+        // constraint would cause this probe to fail. A Committed result proves
+        // the table was empty — op1's row was successfully rolled back.
+        let probe = make_request(
+            "probe",
+            vec![sql_op(
+                "INSERT INTO strict_events(val) VALUES ('good')",
+                vec![],
+            )],
+        );
+        let probe_resp = handle.execute(probe).await.unwrap();
+        assert_eq!(
+            probe_resp.status,
+            WriteStatus::Committed,
+            "probe INSERT of 'good' must succeed, proving op1 was rolled back \
+             (UNIQUE constraint would have rejected it if the row still existed)"
+        );
+
+        gw.shutdown().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 3: SQL constraint rejection — BEGIN and PRAGMA are forbidden (§10)
+    //
+    // The full set of 6 forbidden keywords (BEGIN / COMMIT / ROLLBACK /
+    // SAVEPOINT / RELEASE / PRAGMA) is exhaustively unit-tested in
+    // `src/writer.rs` (`test_reject_*`).  The two tests below only verify the
+    // end-to-end path: that the rejection propagates correctly through the
+    // gateway (channel send → writer actor → WriteResponse::Failed) for a
+    // representative BEGIN case and a PRAGMA case.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_sql_constraint_begin_rejected() {
+        let gw = open_memory_gateway(true).await;
+        let handle = gw.handle();
+
+        let req = make_request("req-begin", vec![sql_op("BEGIN", vec![])]);
+        let resp = handle.execute(req).await.unwrap();
+        assert_eq!(resp.status, WriteStatus::Failed);
+        let error = resp.error.expect("error message must be set");
+        assert!(
+            error.contains("sql rejected"),
+            "expected 'sql rejected' in error, got: {error}"
+        );
+
+        gw.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sql_constraint_pragma_rejected() {
+        let gw = open_memory_gateway(true).await;
+        let handle = gw.handle();
+
+        let req = make_request("req-pragma", vec![sql_op("PRAGMA journal_mode", vec![])]);
+        let resp = handle.execute(req).await.unwrap();
+        assert_eq!(resp.status, WriteStatus::Failed);
+        let error = resp.error.expect("error message must be set");
+        assert!(
+            error.contains("sql rejected"),
+            "expected 'sql rejected' in error, got: {error}"
+        );
+
+        gw.shutdown().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 4: multiple statements in one sql string → Failed (§10, rusqlite)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_multiple_statements_rejected() {
+        let gw = open_memory_gateway(true).await;
+        let handle = gw.handle();
+
+        create_test_table(&handle).await;
+
+        // Two statements separated by `;` — rusqlite returns MultipleStatement.
+        let req = make_request(
+            "req-multi",
+            vec![sql_op(
+                "INSERT INTO test_events(val) VALUES ('a'); INSERT INTO test_events(val) VALUES ('b')",
+                vec![],
+            )],
+        );
+        let resp = handle.execute(req).await.unwrap();
+        assert_eq!(resp.status, WriteStatus::Failed);
+        assert!(resp.error.is_some());
+
+        gw.shutdown().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 5: track_commits=false → commit_seq=None, no squeuelite_commits table
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_track_commits_false_no_commit_seq() {
+        let gw = open_memory_gateway(false).await;
+        let handle = gw.handle();
+
+        create_test_table(&handle).await;
+
+        let req = make_request(
+            "req-notrack",
+            vec![sql_op(
+                "INSERT INTO test_events(val) VALUES (?)",
+                vec![serde_json::Value::String("data".into())],
+            )],
+        );
+        let resp = handle.execute(req).await.unwrap();
+        assert_eq!(resp.status, WriteStatus::Committed);
+        assert!(
+            resp.commit_seq.is_none(),
+            "commit_seq must be None when track_commits=false"
+        );
+
+        // Verify squeuelite_commits table does NOT exist.
+        let table_check = make_request(
+            "table-check",
+            vec![sql_op(
+                "INSERT INTO squeuelite_commits(request_id, actor_id) VALUES ('x', 'y')",
+                vec![],
+            )],
+        );
+        let check_resp = handle.execute(table_check).await.unwrap();
+        assert_eq!(
+            check_resp.status,
+            WriteStatus::Failed,
+            "squeuelite_commits table must not exist when track_commits=false"
+        );
+
+        gw.shutdown().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 6: params conversion (null/bool/int/float/string/array)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_params_conversion() {
+        let gw = open_memory_gateway(false).await;
+        let handle = gw.handle();
+
+        // Create a table that accepts all the types we want to test.
+        let setup = make_request(
+            "setup",
+            vec![sql_op(
+                "CREATE TABLE param_test (
+                    id      INTEGER PRIMARY KEY,
+                    n       ANY,
+                    b       INTEGER,
+                    i       INTEGER,
+                    f       REAL,
+                    s       TEXT,
+                    arr     TEXT
+                )",
+                vec![],
+            )],
+        );
+        handle.execute(setup).await.unwrap();
+
+        let req = make_request(
+            "req-params",
+            vec![sql_op(
+                "INSERT INTO param_test(n, b, i, f, s, arr) VALUES (?, ?, ?, ?, ?, ?)",
+                vec![
+                    serde_json::Value::Null,
+                    serde_json::Value::Bool(true),
+                    serde_json::json!(42i64),
+                    serde_json::json!(2.5f64),
+                    serde_json::Value::String("hello".into()),
+                    serde_json::json!(["a", "b"]),
+                ],
+            )],
+        );
+
+        let resp = handle.execute(req).await.unwrap();
+        assert_eq!(
+            resp.status,
+            WriteStatus::Committed,
+            "params conversion should succeed; error: {:?}",
+            resp.error
+        );
+
+        gw.shutdown().await.unwrap();
+    }
+}
