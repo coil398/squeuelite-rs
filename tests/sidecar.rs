@@ -21,14 +21,14 @@ fn temp_prefix() -> String {
     format!("/tmp/squeuelite_test_{id}_{}", std::process::id())
 }
 
-/// Start a `SidecarGateway` in a background task.
+/// Start a `SidecarGateway` in a background task with a custom `socket_mode`.
 ///
 /// Returns `(socket_path, db_path, shutdown_notify)`.
 /// Call `shutdown_notify.notify_one()` to trigger graceful shutdown.
 ///
 /// `allow_schema_write` is set to `true` so that tests can CREATE tables via
 /// the write channel without being rejected by the §23 security filter.
-async fn start_gateway() -> (PathBuf, PathBuf, Arc<Notify>) {
+async fn start_gateway_with_mode(socket_mode: u32) -> (PathBuf, PathBuf, Arc<Notify>) {
     let prefix = temp_prefix();
     let db_path = PathBuf::from(format!("{prefix}.db"));
     let socket_path = PathBuf::from(format!("{prefix}.sock"));
@@ -39,6 +39,7 @@ async fn start_gateway() -> (PathBuf, PathBuf, Arc<Notify>) {
     let config = SidecarConfig {
         gateway: gateway_config,
         socket_path: socket_path.clone(),
+        socket_mode,
     };
     let gateway = SidecarGateway::open(config).expect("open gateway");
 
@@ -65,6 +66,11 @@ async fn start_gateway() -> (PathBuf, PathBuf, Arc<Notify>) {
     );
 
     (socket_path, db_path, notify)
+}
+
+/// Start a `SidecarGateway` with the default socket mode (0o600).
+async fn start_gateway() -> (PathBuf, PathBuf, Arc<Notify>) {
+    start_gateway_with_mode(0o600).await
 }
 
 /// Clean up leftover temp files after a test.
@@ -384,6 +390,58 @@ async fn test_shutdown_removes_socket() {
         "socket file must be removed after shutdown"
     );
 
+    cleanup(&[&socket, &db]);
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: socket permissions — default 0o600 (owner-only)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_socket_permission_default_0o600() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (socket, db, shutdown) = start_gateway().await;
+
+    let mode = std::fs::metadata(&socket)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    assert_eq!(
+        mode, 0o600,
+        "default socket_mode must be 0o600, got 0o{mode:o}"
+    );
+
+    shutdown.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cleanup(&[&socket, &db]);
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: socket permissions — custom 0o660 (owner + group)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_socket_permission_custom_0o660() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (socket, db, shutdown) = start_gateway_with_mode(0o660).await;
+
+    let mode = std::fs::metadata(&socket)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    assert_eq!(
+        mode, 0o660,
+        "socket_mode 0o660 must be applied after bind, got 0o{mode:o}"
+    );
+
+    shutdown.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
     cleanup(&[&socket, &db]);
 }
 

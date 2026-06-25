@@ -13,8 +13,11 @@
 //!
 //! Only Unix Domain Sockets are used; TCP is not supported. Access control is
 //! delegated to filesystem permissions on the socket file. After bind, the
-//! socket file is set to `0o600` (owner-only read/write) so that other users
-//! on the same host cannot connect even if the umask is permissive.
+//! socket file is set to the mode specified by [`SidecarConfig::socket_mode`]
+//! (default `0o600`, owner-only read/write) so that other users on the same
+//! host cannot connect even if the umask is permissive. To allow agents running
+//! as a shared group to connect, set `socket_mode = 0o660` and ensure all
+//! callers belong to the same Unix group (§23).
 
 /// Maximum line length accepted from a single client read (§23 DoS mitigation).
 ///
@@ -51,16 +54,32 @@ use crate::{
 ///
 /// `gateway` controls the underlying SQLite writer (§16 PRAGMAs, §14 queue).
 /// `socket_path` is the Unix Domain Socket path that agents connect to (§7.1).
+///
+/// ## Socket permissions (§23)
+///
+/// `socket_mode` sets the Unix permission bits applied to the socket file after
+/// bind. The default `0o600` restricts access to the owner only (secure by
+/// default). For multi-user or multi-container scenarios where agents run under
+/// a shared Unix group, set `socket_mode = 0o660` and ensure all callers
+/// belong to the same group.
 #[derive(Debug, Clone)]
 pub struct SidecarConfig {
     /// Writer configuration passed to [`InProcessGateway::open_with_config`].
     pub gateway: GatewayConfig,
     /// Path of the Unix Domain Socket to bind (§7.1, §23).
     pub socket_path: PathBuf,
+    /// Unix permission mode for the socket file (octal, default `0o600`).
+    ///
+    /// Applied via `std::fs::set_permissions` immediately after bind. A value
+    /// of `0o600` restricts access to the owner only. Use `0o660` to allow
+    /// agents in the same group to connect (multi-user/multi-container setups).
+    pub socket_mode: u32,
 }
 
 impl SidecarConfig {
     /// Convenience constructor: file DB at `db_path`, socket at `socket_path`.
+    ///
+    /// Sets `socket_mode` to `0o600` (owner-only, secure by default).
     pub fn new(
         db_path: impl Into<PathBuf>,
         socket_path: impl Into<PathBuf>,
@@ -68,6 +87,7 @@ impl SidecarConfig {
         Self {
             gateway: GatewayConfig::new(db_path),
             socket_path: socket_path.into(),
+            socket_mode: 0o600,
         }
     }
 }
@@ -97,6 +117,7 @@ impl SidecarConfig {
 pub struct SidecarGateway {
     inner: InProcessGateway,
     socket_path: PathBuf,
+    socket_mode: u32,
     stats: Arc<Stats>,
 }
 
@@ -110,6 +131,7 @@ impl SidecarGateway {
         Ok(Self {
             inner,
             socket_path: config.socket_path,
+            socket_mode: config.socket_mode,
             stats: Stats::new_arc(),
         })
     }
@@ -125,6 +147,7 @@ impl SidecarGateway {
     /// 6. Shut down the [`InProcessGateway`] (WAL checkpoint §16).
     pub async fn run(self, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
         let socket_path = self.socket_path.clone();
+        let socket_mode = self.socket_mode;
 
         // Step 1 — remove stale socket (ignore error if it doesn't exist).
         let _ = std::fs::remove_file(&socket_path);
@@ -133,7 +156,11 @@ impl SidecarGateway {
         let listener = UnixListener::bind(&socket_path)
             .map_err(|e| crate::error::Error::Io(e.to_string()))?;
 
-        // Step 2a — restrict socket to owner-only (§23).
+        // Step 2a — set socket permissions (§23).
+        //
+        // The mode is taken from `SidecarConfig::socket_mode` (default `0o600`,
+        // owner-only). For agents running across multiple users or containers,
+        // set `socket_mode = 0o660` and use a shared Unix group (§23).
         //
         // Best-effort: if `set_permissions` fails (e.g. the filesystem does not
         // support Unix permission bits), we emit a warning to stderr and continue.
@@ -141,11 +168,11 @@ impl SidecarGateway {
         // parent directory in that case.
         {
             use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o600);
+            let perms = fs::Permissions::from_mode(socket_mode);
             if let Err(e) = fs::set_permissions(&socket_path, perms) {
                 eprintln!(
-                    "squeuelite: warning: failed to set socket permissions to 0o600 \
-                     on {socket_path:?}: {e}"
+                    "squeuelite: warning: failed to set socket permissions to \
+                     0o{socket_mode:o} on {socket_path:?}: {e}"
                 );
             }
         }

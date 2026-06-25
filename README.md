@@ -208,8 +208,12 @@ One JSON object per line (`\n` terminated) over a Unix Domain Socket.
 ## Security (§23)
 
 - **Transport**: Unix Domain Sockets only — no TCP. The socket file is created
-  with `0o600` (owner read/write only). Access control is via filesystem
-  permissions.
+  with `0o600` (owner read/write only) by default. Access control is via
+  filesystem permissions. To allow agents running as a different user or in a
+  separate container to connect, set `SidecarConfig.socket_mode = 0o660` (and
+  add all callers to a shared Unix group), or pass `--socket-mode 660` to the
+  `squeuelite-gateway` binary. The default `0o600` is kept as the secure-by-
+  default baseline; relaxing it requires an explicit opt-in.
 - **Trust model**: all callers are assumed to be trusted local processes (MVP).
 - **SQL guard rails**: `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `RELEASE` /
   `PRAGMA` are **always** rejected — the gateway owns the transaction lifecycle.
