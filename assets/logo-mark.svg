@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <!-- Many concurrent agents converge into one writer channel, then into storage. -->
+  <title id="title">SqueueLite icon mark</title>
+  <desc id="desc">Three streams converge into a single passage flowing into a database.</desc>
+  <defs>
+    <linearGradient id="stream" x1="8" y1="12" x2="45" y2="46" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5fd3c7"/>
+      <stop offset="1" stop-color="#168c94"/>
+    </linearGradient>
+    <linearGradient id="store" x1="41" y1="18" x2="58" y2="50" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#233b8f"/>
+      <stop offset="1" stop-color="#10243f"/>
+    </linearGradient>
+  </defs>
+  <path d="M15 17 C24 17 25 28 34 32" fill="none" stroke="url(#stream)" stroke-width="5.5" stroke-linecap="round"/>
+  <path d="M15 32 H42" fill="none" stroke="url(#stream)" stroke-width="7" stroke-linecap="round"/>
+  <path d="M15 47 C24 47 25 36 34 32" fill="none" stroke="url(#stream)" stroke-width="5.5" stroke-linecap="round"/>
+  <circle cx="10" cy="17" r="4.5" fill="#72ddd3"/>
+  <circle cx="10" cy="32" r="4.5" fill="#39b7b1"/>
+  <circle cx="10" cy="47" r="4.5" fill="#168c94"/>
+  <path d="M39 24 C39 20.7 43.3 18 48.5 18 C53.7 18 58 20.7 58 24 V45 C58 48.3 53.7 51 48.5 51 C43.3 51 39 48.3 39 45 Z" fill="url(#store)"/>
+  <path d="M39 24 C39 27.3 43.3 30 48.5 30 C53.7 30 58 27.3 58 24" fill="none" stroke="#7fd8d0" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M39 35 C39 38.3 43.3 41 48.5 41 C53.7 41 58 38.3 58 35" fill="none" stroke="#4965b8" stroke-width="2" stroke-linecap="round" opacity=".8"/>
+</svg>

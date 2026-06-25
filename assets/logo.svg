@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 72" role="img" aria-labelledby="title desc">
+  <!-- Many concurrent agents converge into one writer channel, then into storage. -->
+  <title id="title">SqueueLite horizontal logo</title>
+  <desc id="desc">Icon mark and SqueueLite wordmark for a SQLite write gateway.</desc>
+  <defs>
+    <linearGradient id="hStream" x1="8" y1="16" x2="56" y2="52" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#62d6cb"/>
+      <stop offset="1" stop-color="#158b93"/>
+    </linearGradient>
+    <linearGradient id="hStore" x1="48" y1="19" x2="68" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#253f96"/>
+      <stop offset="1" stop-color="#10243f"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(4 4)">
+    <path d="M15 18 C25 18 27 29 38 34" fill="none" stroke="url(#hStream)" stroke-width="5.5" stroke-linecap="round"/>
+    <path d="M15 34 H49" fill="none" stroke="url(#hStream)" stroke-width="7" stroke-linecap="round"/>
+    <path d="M15 50 C25 50 27 39 38 34" fill="none" stroke="url(#hStream)" stroke-width="5.5" stroke-linecap="round"/>
+    <circle cx="10" cy="18" r="4.5" fill="#72ddd3"/>
+    <circle cx="10" cy="34" r="4.5" fill="#39b7b1"/>
+    <circle cx="10" cy="50" r="4.5" fill="#168c94"/>
+    <path d="M46 25 C46 21.7 50.5 19 56 19 C61.5 19 66 21.7 66 25 V47 C66 50.3 61.5 53 56 53 C50.5 53 46 50.3 46 47 Z" fill="url(#hStore)"/>
+    <path d="M46 25 C46 28.3 50.5 31 56 31 C61.5 31 66 28.3 66 25" fill="none" stroke="#7fd8d0" stroke-width="2.4" stroke-linecap="round"/>
+    <path d="M46 36 C46 39.3 50.5 42 56 42 C61.5 42 66 39.3 66 36" fill="none" stroke="#4d68bb" stroke-width="2" stroke-linecap="round" opacity=".8"/>
+  </g>
+  <text x="87" y="45" fill="#10243f" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="29" font-weight="750" letter-spacing="0">Squeue<tspan fill="#168c94">Lite</tspan></text>
+</svg>
