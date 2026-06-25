@@ -4,3 +4,4 @@ Cargo.lock
 *.db-wal
 *.db-shm
 __pycache__/
+/docs/plans/

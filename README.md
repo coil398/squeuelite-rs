@@ -2,6 +2,13 @@
   <img src="assets/logo.png" alt="SqueueLite" width="360">
 </p>
 
+<p align="center">
+  <a href="https://github.com/coil398/squeuelite-rs/actions/workflows/ci.yml"><img src="https://github.com/coil398/squeuelite-rs/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://crates.io/crates/squeuelite"><img src="https://img.shields.io/crates/v/squeuelite.svg" alt="crates.io"></a>
+  <a href="https://docs.rs/squeuelite"><img src="https://img.shields.io/docsrs/squeuelite" alt="docs.rs"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0"></a>
+</p>
+
 # SqueueLite
 
 **SqueueLite is not a job queue.**

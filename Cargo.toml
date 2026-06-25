@@ -2,13 +2,15 @@
 name = "squeuelite"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.82"
 description = "A single-writer gateway for SQLite-backed agent systems: serializes concurrent writes through one SQLite writer."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/coil398/squeuelite-rs"
 keywords = ["sqlite", "gateway", "writer", "agent", "wal"]
 categories = ["database", "concurrency"]
 readme = "README.md"
+# Keep the published crate free of internal artifacts and CI config.
+exclude = [".github/", "docs/plans/"]
 
 [dependencies]
 rusqlite = { version = "0.40" }
@@ -31,8 +33,8 @@ axum = { version = "0.8", optional = true, default-features = false, features = 
 default = ["bundled"]
 bundled = ["rusqlite/bundled"]
 inprocess = ["dep:tokio", "dep:base64"]
-# `sidecar` adds the Unix Domain Socket gateway, JSON Lines protocol, and
-# the sidecar Client. Enables `inprocess` (which brings in tokio), plus
+# `sidecar` adds the Unix Domain Socket gateway (JSON-RPC 2.0) and the
+# sidecar Client. Enables `inprocess` (which brings in tokio), plus
 # the tokio net/io-util/signal features required for UDS accept loops (§18).
 sidecar = ["inprocess", "dep:uuid", "tokio/net", "tokio/io-util", "tokio/signal", "tokio/time"]
 # `http` adds the HTTP JSON-RPC endpoint (POST /rpc, GET /health) via axum 0.8.
