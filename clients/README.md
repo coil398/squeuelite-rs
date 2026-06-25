@@ -28,6 +28,9 @@ All clients implement the same contract:
 - **Multiple ops in one call** = one atomic transaction (all-or-nothing).
 - **`idempotency_key`** makes a write safe to retry (the gateway dedups it).
 - **Admin**: `stats` / `health` / `checkpoint`.
+- **Binary / BLOB**: JSON can't carry raw bytes, so wrap them with each client's
+  `blob(...)` helper — it produces a `{"$blob": "<base64>"}` value that the gateway
+  decodes into a real BLOB. Reads come back as native bytes from your own driver.
 
 > SqueueLite handles **writes only**. For reads, open the SQLite file directly
 > with your language's driver in **read-only** mode (WAL lets readers run

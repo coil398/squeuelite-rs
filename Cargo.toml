@@ -20,6 +20,7 @@ tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time"
 # the inprocess_writer example and by `#[tokio::test]`; `rt` alone is insufficient.
 # `time`: required for `tokio::time::timeout` used by `OverflowPolicy::WaitTimeout` (§14).
 uuid = { version = "1", features = ["v7"], optional = true }
+base64 = { version = "0.22", optional = true }
 
 [features]
 # `bundled` compiles SQLite from source (SQLite 3.53.x), guaranteeing
@@ -28,7 +29,7 @@ uuid = { version = "1", features = ["v7"], optional = true }
 # `default-features = false` to link the system SQLite.
 default = ["bundled"]
 bundled = ["rusqlite/bundled"]
-inprocess = ["dep:tokio"]
+inprocess = ["dep:tokio", "dep:base64"]
 # `sidecar` adds the Unix Domain Socket gateway, JSON Lines protocol, and
 # the sidecar Client. Enables `inprocess` (which brings in tokio), plus
 # the tokio net/io-util/signal features required for UDS accept loops (§18).

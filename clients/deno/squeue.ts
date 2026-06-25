@@ -14,6 +14,14 @@
 //     { idempotencyKey: "run-7:step-1", runId: "run-7" });
 //   db.close();
 
+// Wrap binary data for a BLOB column parameter: {"$blob": "<base64>"}.
+//   db.execute("INSERT INTO files(data) VALUES (?)", [blob(bytes)])
+export function blob(data: Uint8Array): { $blob: string } {
+  let bin = "";
+  for (const b of data) bin += String.fromCharCode(b);
+  return { $blob: btoa(bin) };
+}
+
 export interface WriteOpts {
   idempotencyKey?: string;
   runId?: string;

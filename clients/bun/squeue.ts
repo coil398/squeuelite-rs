@@ -19,6 +19,12 @@
 
 import type { Socket } from "bun";
 
+// Wrap binary data for a BLOB column parameter: {"$blob": "<base64>"}.
+//   db.execute("INSERT INTO files(data) VALUES (?)", [blob(bytes)])
+export function blob(data: Uint8Array | ArrayBuffer): { $blob: string } {
+  return { $blob: Buffer.from(data as Uint8Array).toString("base64") };
+}
+
 export interface WriteOpts {
   idempotencyKey?: string;
   runId?: string;

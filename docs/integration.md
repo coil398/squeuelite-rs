@@ -205,6 +205,42 @@ handle.execute(WriteRequest {
 gateway.shutdown().await?;   // on shutdown — flushes the WAL checkpoint
 ```
 
+### 4.8 Binary / BLOB
+
+Because the wire protocol is JSON Lines, raw bytes cannot be sent as-is. Encode binary data
+as RFC 4648 standard base64 and wrap it in a `{"$blob": "<base64>"}` sentinel object.
+The gateway detects the single-key sentinel, decodes the base64, and binds a native BLOB to
+the SQL placeholder — so SQLite stores the data as the `blob` storage class, not as text.
+
+```python
+import base64
+import sqlite3
+
+# --- Write via the gateway ---
+data = b"\x89PNG\r\n..."          # arbitrary bytes
+encoded = base64.b64encode(data).decode()   # RFC 4648 standard base64
+
+db.execute(
+    "INSERT INTO files(name, data) VALUES (?, ?)",
+    ["avatar.png", {"$blob": encoded}],
+)
+
+# --- Read directly with your SQLite driver (gateway has no read API) ---
+con = sqlite3.connect("file:./app.db?mode=ro", uri=True)
+row = con.execute("SELECT data FROM files WHERE name = ?", ["avatar.png"]).fetchone()
+recovered: bytes = row[0]   # the driver returns bytes natively
+assert recovered == data
+```
+
+Rules for the sentinel:
+- The object must have **exactly one key** named `"$blob"` with a **string** value.
+- Any other shape (multiple keys, non-string value, or a different key name) is treated as a
+  plain JSON object and serialised to text — no BLOB decoding occurs.
+- An invalid base64 string returns a `Failed` response with an `invalid parameter` error.
+- **Reading BLOBs** is always done by opening the SQLite file directly with your language's
+  driver. The driver returns `bytes` / `[]byte` / `Buffer` / `Vec<u8>` automatically.
+  SqueueLite never wraps reads.
+
 ### 4.7 Observability
 
 ```python

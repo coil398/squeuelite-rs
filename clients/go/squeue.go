@@ -21,6 +21,7 @@ package squeue
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -32,6 +33,13 @@ import (
 type Op struct {
 	SQL    string `json:"sql"`
 	Params []any  `json:"params"`
+}
+
+// Blob wraps binary data for a BLOB column parameter: {"$blob": "<base64>"}.
+//
+//	c.Execute("INSERT INTO files(data) VALUES (?)", []any{squeue.Blob(bytes)})
+func Blob(data []byte) map[string]string {
+	return map[string]string{"$blob": base64.StdEncoding.EncodeToString(data)}
 }
 
 // Response is the gateway's reply to a write request.

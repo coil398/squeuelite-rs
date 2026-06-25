@@ -218,6 +218,21 @@ One JSON object per line (`\n` terminated) over a Unix Domain Socket.
 { "status": "ok" }
 ```
 
+### Binary data (BLOB)
+
+Params are JSON values, so raw bytes cannot be sent directly. Wrap binary data in a
+`{"$blob": "<base64>"}` sentinel — a single-key object whose value is the
+RFC 4648 standard base64 encoding of the bytes:
+
+```json
+{"request_id":"r1","actor_id":"agent-a","operations":[{"sql":"INSERT INTO files(data) VALUES (?)","params":[{"$blob":"aGVsbG8="}]}]}
+```
+
+The gateway decodes the base64 and binds a `BLOB` to the `?` placeholder, so SQLite stores
+it as the binary storage class (not as text). **Reads are done directly through your
+language's SQLite driver**, which returns the bytes natively — SqueueLite has no read API
+by design.
+
 ---
 
 ## Security (§23)

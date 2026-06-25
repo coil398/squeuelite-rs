@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::prelude::{BASE64_STANDARD, Engine as _};
 use rusqlite::{Connection, TransactionBehavior, types::Value};
 use tokio::sync::{mpsc, oneshot};
 
@@ -821,6 +822,19 @@ fn json_to_sqlite(v: &serde_json::Value) -> Result<Value> {
             }
         }
         serde_json::Value::String(s) => Value::Text(s.clone()),
+        // `{"$blob": "<base64>"}` sentinel: single-key object with "$blob" string value
+        // → decode base64 and store as SQLite BLOB.
+        // Any other object (multiple keys, "$blob" with non-string value, or no "$blob" key)
+        // → fall through to JSON text serialisation (existing behaviour).
+        serde_json::Value::Object(map)
+            if map.len() == 1 && map.get("$blob").and_then(|b| b.as_str()).is_some() =>
+        {
+            let encoded = map["$blob"].as_str().unwrap();
+            let bytes = BASE64_STANDARD
+                .decode(encoded)
+                .map_err(|e| Error::InvalidParam(format!("$blob base64 decode failed: {e}")))?;
+            Value::Blob(bytes)
+        }
         other => Value::Text(serde_json::to_string(other)?),
     })
 }
@@ -1124,6 +1138,92 @@ mod tests {
     fn test_json_object_converts_to_sqlite_text_json() {
         let result = json_to_sqlite(&json!({"key": "val"})).unwrap();
         assert_eq!(result, Value::Text(r#"{"key":"val"}"#.to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // json_to_sqlite — $blob sentinel
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_blob_sentinel_decodes_base64_to_blob() {
+        // "aGVsbG8=" is base64 for b"hello"
+        let result = json_to_sqlite(&json!({"$blob": "aGVsbG8="})).unwrap();
+        assert_eq!(result, Value::Blob(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn test_blob_sentinel_invalid_base64_returns_err() {
+        let result = json_to_sqlite(&json!({"$blob": "!!!notbase64!!!"}));
+        assert!(result.is_err(), "invalid base64 must return Err");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid parameter"),
+            "error must mention 'invalid parameter', got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_blob_sentinel_non_string_value_falls_through_to_text() {
+        // {"$blob": 123} — value is not a string → treat as plain object (JSON text)
+        let result = json_to_sqlite(&json!({"$blob": 123})).unwrap();
+        assert_eq!(result, Value::Text(r#"{"$blob":123}"#.to_string()));
+    }
+
+    #[test]
+    fn test_blob_sentinel_multiple_keys_falls_through_to_text() {
+        // {"$blob": "...", "x": 1} — more than one key → not a sentinel
+        let result = json_to_sqlite(&json!({"$blob": "aGVsbG8=", "x": 1})).unwrap();
+        // Must be JSON text (key order from serde_json is insertion order for maps)
+        assert!(
+            matches!(result, Value::Text(_)),
+            "multi-key object must be stored as Text(JSON)"
+        );
+        // Must NOT be a Blob
+        assert!(
+            !matches!(result, Value::Blob(_)),
+            "multi-key object must not be decoded as Blob"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BLOB round-trip: write via gateway → read back as bytes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_blob_roundtrip_stored_as_blob_not_text() {
+        let mut writer = make_test_writer();
+
+        // Create a BLOB column table.
+        writer
+            .conn
+            .execute_batch("CREATE TABLE blob_t (b BLOB);")
+            .unwrap();
+
+        // INSERT using the $blob sentinel (base64 of b"hello").
+        let req = make_write_request(vec![(
+            "INSERT INTO blob_t(b) VALUES (?)",
+            vec![json!({"$blob": "aGVsbG8="})],
+        )]);
+        let resp = writer.apply(req);
+        assert_eq!(
+            resp.status,
+            crate::request::WriteStatus::Committed,
+            "blob INSERT must commit"
+        );
+
+        // Read back the raw bytes and the SQLite storage class.
+        let (bytes, type_of): (Vec<u8>, String) = writer
+            .conn
+            .query_row("SELECT b, typeof(b) FROM blob_t", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+
+        assert_eq!(bytes, b"hello", "stored bytes must match original data");
+        assert_eq!(
+            type_of, "blob",
+            "SQLite typeof() must be 'blob', not 'text' — data was not stored as JSON string"
+        );
     }
 
     // -----------------------------------------------------------------------

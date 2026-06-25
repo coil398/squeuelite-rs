@@ -19,6 +19,13 @@
 import net from "node:net";
 import { randomUUID } from "node:crypto";
 
+// Wrap binary data for a BLOB column parameter: {"$blob": "<base64>"}.
+// `data` may be a Buffer, Uint8Array, or ArrayBuffer.
+//   db.execute("INSERT INTO files(data) VALUES (?)", [blob(buf)])
+export function blob(data) {
+  return { $blob: Buffer.from(data).toString("base64") };
+}
+
 export class Squeue {
   #sock;
   #buf = "";

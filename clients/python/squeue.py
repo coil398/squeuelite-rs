@@ -19,9 +19,19 @@ Example
 No third-party dependencies; standard library only.
 """
 
+import base64
 import json
 import socket
 import uuid
+
+
+def blob(data: bytes) -> dict:
+    """Wrap binary data for a BLOB column parameter: {"$blob": "<base64>"}.
+
+    Example:
+        db.execute("INSERT INTO files(data) VALUES (?)", [blob(b"\\x00\\x01\\x02")])
+    """
+    return {"$blob": base64.b64encode(data).decode("ascii")}
 
 
 def _request_id() -> str:

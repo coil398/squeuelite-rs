@@ -12,6 +12,7 @@
 //! tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros"] }
 //! serde_json = "1"
 //! uuid = { version = "1", features = ["v7"] }
+//! base64 = "0.22"   # only needed for the `blob()` helper
 //! ```
 //!
 //! Example:
@@ -36,6 +37,17 @@ use tokio::{
         unix::{OwnedReadHalf, OwnedWriteHalf},
     },
 };
+
+/// Wrap binary data as a `{"$blob": "<base64>"}` param value.
+///
+/// ```ignore
+/// db.execute("INSERT INTO files(data) VALUES (?)",
+///            serde_json::json!([blob(&bytes)]), None, None).await?;
+/// ```
+pub fn blob(data: &[u8]) -> Value {
+    use base64::prelude::{BASE64_STANDARD, Engine as _};
+    json!({ "$blob": BASE64_STANDARD.encode(data) })
+}
 
 pub struct Squeue {
     actor_id: String,

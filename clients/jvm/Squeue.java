@@ -18,12 +18,20 @@ import java.net.UnixDomainSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.List;
 import java.util.UUID;
 
 public final class Squeue implements AutoCloseable {
     private final String actorId;
     private final SocketChannel ch;
+
+    /**
+     * Wrap binary data for a BLOB column parameter ({@code {"$blob": "<base64>"}}).
+     * Pass an instance as a param value:
+     * {@code db.execute("INSERT INTO files(data) VALUES (?)", List.of(new Squeue.Blob(bytes)))}
+     */
+    public record Blob(byte[] data) {}
 
     public Squeue(String socketPath, String actorId) throws IOException {
         this.actorId = actorId;
@@ -97,6 +105,9 @@ public final class Squeue implements AutoCloseable {
     private static String jsonValue(Object v) {
         if (v == null) return "null";
         if (v instanceof Number || v instanceof Boolean) return v.toString();
+        if (v instanceof Blob b) {
+            return "{\"$blob\":" + jsonStr(Base64.getEncoder().encodeToString(b.data())) + "}";
+        }
         return jsonStr(v.toString());
     }
 
