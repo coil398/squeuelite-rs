@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="SqueueLite" width="360">
+  <img src="assets/logo.png" alt="SqueueLite" width="360">
 </p>
 
 # SqueueLite
