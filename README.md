@@ -24,6 +24,22 @@ or run long-lived background tasks.
 
 ## Modes
 
+SqueueLite runs in one of two modes. Both wrap the **same single-writer actor**;
+they differ only in *how* callers reach it.
+
+| | **In-process** | **Sidecar** |
+|---|---|---|
+| Shape | One Rust process, many async tasks | A **separate process** (`squeuelite-gateway`) |
+| Transport | In-memory channel (no socket) | Unix Domain Socket + JSON Lines |
+| Callers | Rust code via `InProcessGateway` | **Any language** that can write to the socket |
+| Speed | Fastest | Slightly slower (socket hop) |
+| Use when | All writers live in one Rust binary | Writers are separate OS processes (incl. non-Rust) |
+
+The **sidecar** is the `squeuelite-gateway` binary: a standalone daemon that owns
+the one and only writer connection. Your agent processes don't open the database
+themselves — they send write requests to the daemon's socket, and it serialises
+them into SQLite. This is what lets non-Rust agents (Python, Go, …) write safely.
+
 ### In-process (single Rust process, multiple async tasks)
 
 Enable the `inprocess` feature:
@@ -111,10 +127,47 @@ echo '{"type":"stats"}' | socat UNIX-CONNECT:./squeuelite.sock -
 # WAL checkpoint
 echo '{"type":"checkpoint"}' | socat UNIX-CONNECT:./squeuelite.sock -
 
-# Write request
+# Write request (table `t` must already exist — see "Setting up your schema")
 echo '{"request_id":"r1","actor_id":"agent-a","operations":[{"sql":"INSERT INTO t(v) VALUES (?)","params":["hello"]}]}' \
   | socat UNIX-CONNECT:./squeuelite.sock -
 ```
+
+---
+
+## Setting up your schema
+
+By default the gateway runs with **secure write restrictions** (§23): schema
+changes (`CREATE` / `ALTER` / `DROP` / `TRUNCATE`) are **rejected**. A fresh
+database therefore has no application tables, and you **cannot create them by
+sending `CREATE TABLE` through the gateway** unless you opt in. Choose one:
+
+- **Pre-create the schema** — recommended for the `squeuelite-gateway` binary.
+  Build your tables in the database file *before* starting the gateway:
+
+  ```bash
+  sqlite3 ./app.db < schema.sql
+  squeuelite-gateway --db ./app.db --socket ./squeuelite.sock
+  ```
+
+  The gateway then only serialises writes against the existing schema.
+
+- **Allow schema writes explicitly** — for in-process, or your own gateway binary.
+  Set `allow_schema_write = true` on the config:
+
+  ```rust
+  let mut config = GatewayConfig::new("./app.db");
+  config.allow_schema_write = true;          // permit CREATE / ALTER over the gateway
+  let gateway = InProcessGateway::open_with_config(config)?;
+  ```
+
+  For the sidecar, set the same flag on `SidecarConfig` and call
+  `SidecarGateway::open(...)` from **your own binary**. The shipped
+  `squeuelite-gateway` binary intentionally uses the locked-down defaults and has
+  no flag to relax them.
+
+> SqueueLite's internal tables (`squeuelite_commits`, `squeuelite_requests`) are
+> always created at startup regardless of these flags — they go through the
+> startup migration path (§17), not the request path.
 
 ---
 
@@ -154,9 +207,41 @@ One JSON object per line (`\n` terminated) over a Unix Domain Socket.
 
 ## Security (§23)
 
-SqueueLite only listens on Unix Domain Sockets (no TCP). Access control is via
-filesystem permissions on the socket file. All callers are assumed to be trusted
-local processes in the MVP.
+- **Transport**: Unix Domain Sockets only — no TCP. The socket file is created
+  with `0o600` (owner read/write only). Access control is via filesystem
+  permissions.
+- **Trust model**: all callers are assumed to be trusted local processes (MVP).
+- **SQL guard rails**: `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `RELEASE` /
+  `PRAGMA` are **always** rejected — the gateway owns the transaction lifecycle.
+  The rest is configurable on `GatewayConfig`:
+
+  | Flag                 | Default | Non-default effect                                   |
+  |----------------------|---------|------------------------------------------------------|
+  | `allow_raw_sql`      | `true`  | `false` → reject every operation                     |
+  | `allow_schema_write` | `false` | `true` → permit `CREATE` / `ALTER` / `DROP` / `TRUNCATE` |
+  | `allow_delete`       | `true`  | `false` → reject `DELETE`                            |
+  | `allow_drop`         | `false` | `true` → permit `DROP`                               |
+
+  These are **first-token checks** (the leading SQL keyword only); a full SQL
+  parser is intentionally out of scope for the MVP, and a table-level allowlist is
+  a future item. The `squeuelite-gateway` binary always uses these defaults.
+
+---
+
+## Other configuration
+
+`GatewayConfig` also exposes (all optional, sensible defaults):
+
+| Field            | Default                  | Purpose                                              |
+|------------------|--------------------------|------------------------------------------------------|
+| `journal_mode`   | `Wal`                    | SQLite journal mode (§16)                            |
+| `synchronous`    | `Normal`                 | `synchronous` PRAGMA (§16)                           |
+| `busy_timeout_ms`| `5000`                   | SQLite busy timeout (§16)                            |
+| `queue_capacity` | `1024`                   | Bounded request channel size (§14)                  |
+| `overflow`       | `WaitTimeout{ millis: 5000 }` | Behaviour when the queue is full: `Wait` / `Reject` / `WaitTimeout` (§14) |
+| `track_commits`  | `true`                   | Record `commit_seq` in `squeuelite_commits` (§12)   |
+| `idempotency`    | `true`                   | Dedup requests carrying an `idempotency_key` (§13)  |
+| `batch`          | `None` (disabled)        | Opportunistic batch-commit of single-op writes (§15)|
 
 ---
 
