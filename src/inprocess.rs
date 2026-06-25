@@ -11,7 +11,7 @@ use crate::{
     config::{GatewayConfig, OverflowPolicy},
     error::{Error, Result},
     request::{WriteRequest, WriteResponse},
-    writer::{Command, LatencyBuffer, Writer, apply_pragmas, new_latency_buffer, run_migrations},
+    writer::{apply_pragmas, new_latency_buffer, run_migrations, Command, LatencyBuffer, Writer},
 };
 
 // ---------------------------------------------------------------------------
@@ -87,7 +87,15 @@ impl InProcessGateway {
             // Connection is Send but !Sync; moving it into the thread is the
             // only safe pattern (Arc<Mutex<Connection>> risks deadlock because
             // rusqlite's internal locking interacts poorly with external locking).
-            Writer::new(conn, rx, track_commits, idempotency, config_clone, latency_buf_writer).run();
+            Writer::new(
+                conn,
+                rx,
+                track_commits,
+                idempotency,
+                config_clone,
+                latency_buf_writer,
+            )
+            .run();
         });
 
         Ok(Self {
@@ -148,9 +156,7 @@ impl InProcessGateway {
 
         // Wait for the writer thread to finish (includes WAL checkpoint §16).
         if let Some(handle) = self.writer_handle.take() {
-            handle
-                .join()
-                .map_err(|_| Error::GatewayClosed)?;
+            handle.join().map_err(|_| Error::GatewayClosed)?;
         }
 
         Ok(())
@@ -654,15 +660,15 @@ mod tests {
         // Create a table first (allow_schema_write=true).
         let setup = make_request(
             "setup",
-            vec![sql_op("CREATE TABLE drop_test (id INTEGER PRIMARY KEY)", vec![])],
+            vec![sql_op(
+                "CREATE TABLE drop_test (id INTEGER PRIMARY KEY)",
+                vec![],
+            )],
         );
         handle.execute(setup).await.unwrap();
 
         // DROP must be rejected (allow_drop=false by default).
-        let req = make_request(
-            "req-drop",
-            vec![sql_op("DROP TABLE drop_test", vec![])],
-        );
+        let req = make_request("req-drop", vec![sql_op("DROP TABLE drop_test", vec![])]);
         let resp = handle.execute(req).await.unwrap();
         assert_eq!(
             resp.status,
@@ -709,10 +715,7 @@ mod tests {
         handle.execute(insert).await.unwrap();
 
         // DELETE must be rejected.
-        let req = make_request(
-            "req-delete",
-            vec![sql_op("DELETE FROM del_test", vec![])],
-        );
+        let req = make_request("req-delete", vec![sql_op("DELETE FROM del_test", vec![])]);
         let resp = handle.execute(req).await.unwrap();
         assert_eq!(
             resp.status,
@@ -767,8 +770,11 @@ mod tests {
 
         // Second call: same key and same operations → returns stored response.
         let resp2 = handle.execute(req.clone()).await.unwrap();
-        assert_eq!(resp2.status, WriteStatus::Committed,
-            "second call with same idempotency_key must return Committed");
+        assert_eq!(
+            resp2.status,
+            WriteStatus::Committed,
+            "second call with same idempotency_key must return Committed"
+        );
 
         // Verify no double-insert (UNIQUE constraint would catch it if there was one).
         // We rely on the fact that the second call should not have inserted again.
@@ -839,28 +845,34 @@ mod tests {
         // Send 2 requests to saturate capacity=1 (one in flight + one in queue).
         let h1 = handle.clone();
         tokio::spawn(async move {
-            let _ = h1.execute(make_request(
-                "fill-1",
-                vec![sql_op("INSERT INTO test_events(val) VALUES ('a')", vec![])],
-            )).await;
+            let _ = h1
+                .execute(make_request(
+                    "fill-1",
+                    vec![sql_op("INSERT INTO test_events(val) VALUES ('a')", vec![])],
+                ))
+                .await;
         });
         // Give the first request time to enter the channel.
         tokio::task::yield_now().await;
 
         let h2 = handle.clone();
         tokio::spawn(async move {
-            let _ = h2.execute(make_request(
-                "fill-2",
-                vec![sql_op("INSERT INTO test_events(val) VALUES ('b')", vec![])],
-            )).await;
+            let _ = h2
+                .execute(make_request(
+                    "fill-2",
+                    vec![sql_op("INSERT INTO test_events(val) VALUES ('b')", vec![])],
+                ))
+                .await;
         });
         tokio::task::yield_now().await;
 
         // Now the third request should be rejected because the queue is full.
-        let result = handle.execute(make_request(
-            "overflow",
-            vec![sql_op("INSERT INTO test_events(val) VALUES ('c')", vec![])],
-        )).await;
+        let result = handle
+            .execute(make_request(
+                "overflow",
+                vec![sql_op("INSERT INTO test_events(val) VALUES ('c')", vec![])],
+            ))
+            .await;
 
         // Either GatewayOverloaded (queue full) or Committed (queue drained by now)
         // are valid outcomes, but we specifically want to verify the Reject path
@@ -897,7 +909,8 @@ mod tests {
 
         // Fill the single slot so the channel is at capacity.
         let fill_cmd = Command::Shutdown; // any variant; we just need the slot taken
-        tx.try_send(fill_cmd).expect("first send must succeed (slot is free)");
+        tx.try_send(fill_cmd)
+            .expect("first send must succeed (slot is free)");
 
         // Now the channel is full. Construct a handle directly.
         let latency_buf = new_latency_buffer();
@@ -907,10 +920,12 @@ mod tests {
             overflow: OverflowPolicy::Reject,
         };
 
-        let result = handle.execute(make_request(
-            "overflow",
-            vec![sql_op("INSERT INTO t VALUES (1)", vec![])],
-        )).await;
+        let result = handle
+            .execute(make_request(
+                "overflow",
+                vec![sql_op("INSERT INTO t VALUES (1)", vec![])],
+            ))
+            .await;
 
         assert!(
             matches!(result, Err(Error::GatewayOverloaded)),
@@ -942,10 +957,12 @@ mod tests {
             overflow: OverflowPolicy::WaitTimeout { millis: 1 }, // 1 ms → fires quickly
         };
 
-        let result = handle.execute(make_request(
-            "timeout-overflow",
-            vec![sql_op("INSERT INTO t VALUES (1)", vec![])],
-        )).await;
+        let result = handle
+            .execute(make_request(
+                "timeout-overflow",
+                vec![sql_op("INSERT INTO t VALUES (1)", vec![])],
+            ))
+            .await;
 
         // Either GatewayOverloaded (timeout) or GatewayClosed (rx dropped) may
         // occur depending on task scheduling. Both are acceptable errors; the
@@ -982,7 +999,10 @@ mod tests {
         // entry. avg > 0.0 proves the buffer is non-empty and the value was
         // actually measured (not just a default zero).
         let (avg_after, p95_after) = handle.latency_snapshot();
-        assert!(avg_after > 0.0, "avg must be positive after a commit (latency buffer must be non-empty)");
+        assert!(
+            avg_after > 0.0,
+            "avg must be positive after a commit (latency buffer must be non-empty)"
+        );
         assert!(p95_after >= p95, "p95 must be non-decreasing");
 
         gw.shutdown().await.unwrap();

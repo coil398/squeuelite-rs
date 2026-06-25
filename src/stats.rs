@@ -8,8 +8,8 @@
 //! (§24 JSON Lines admin interface).
 
 use std::sync::{
-    Arc,
     atomic::{AtomicU64, Ordering},
+    Arc,
 };
 
 use serde::{Deserialize, Serialize};

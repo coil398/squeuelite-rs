@@ -8,8 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use base64::prelude::{BASE64_STANDARD, Engine as _};
-use rusqlite::{Connection, TransactionBehavior, types::Value};
+use base64::prelude::{Engine as _, BASE64_STANDARD};
+use rusqlite::{types::Value, Connection, TransactionBehavior};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -152,12 +152,8 @@ impl Writer {
                             let mut batch: Vec<(WriteRequest, oneshot::Sender<WriteResponse>)> =
                                 vec![(request, respond_to)];
 
-                            let max_size = self
-                                .config
-                                .batch
-                                .as_ref()
-                                .map(|b| b.max_size)
-                                .unwrap_or(64);
+                            let max_size =
+                                self.config.batch.as_ref().map(|b| b.max_size).unwrap_or(64);
 
                             // `deferred_cmd` holds a non-batchable command that was
                             // popped from the queue during drain and must be processed
@@ -178,8 +174,10 @@ impl Writer {
                                             // "don't mix explicit transaction requests").
                                             // Apply this request individually after the
                                             // batch commits.
-                                            deferred_cmd =
-                                                Some(Command::Write { request: r2, respond_to: rt2 });
+                                            deferred_cmd = Some(Command::Write {
+                                                request: r2,
+                                                respond_to: rt2,
+                                            });
                                             break;
                                         }
                                     }
@@ -205,7 +203,10 @@ impl Writer {
                             // Process the deferred command if any.
                             if let Some(cmd) = deferred_cmd {
                                 match cmd {
-                                    Command::Write { request, respond_to } => {
+                                    Command::Write {
+                                        request,
+                                        respond_to,
+                                    } => {
                                         let response = self.apply(request);
                                         let _ = respond_to.send(response);
                                     }
@@ -238,9 +239,7 @@ impl Writer {
         }
 
         // §16 shutdown checkpoint — best effort; ignore errors.
-        let _ = self
-            .conn
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
 
     // -----------------------------------------------------------------------
@@ -335,7 +334,11 @@ impl Writer {
     /// Execute a request and record its result in `squeuelite_requests` (§13).
     ///
     /// Called only when `idempotency=true` and the key is new.
-    fn apply_with_idempotency(&mut self, request: WriteRequest, request_hash: &str) -> WriteResponse {
+    fn apply_with_idempotency(
+        &mut self,
+        request: WriteRequest,
+        request_hash: &str,
+    ) -> WriteResponse {
         let key = request.idempotency_key.clone().unwrap_or_default();
 
         let response = self.apply_inner(request);
@@ -366,7 +369,12 @@ impl Writer {
                      VALUES (?1, ?2, 'committed', ?3, ?4)",
                 )
                 .and_then(|mut stmt| {
-                    stmt.execute(rusqlite::params![key, request_hash, response_json, commit_seq])
+                    stmt.execute(rusqlite::params![
+                        key,
+                        request_hash,
+                        response_json,
+                        commit_seq
+                    ])
                 });
         }
 
@@ -519,7 +527,8 @@ impl Writer {
                     let request_hash = match serde_json::to_string(&request.operations) {
                         Ok(s) => s,
                         Err(e) => {
-                            responses.push((respond_to, WriteResponse::failed(req_id, e.to_string())));
+                            responses
+                                .push((respond_to, WriteResponse::failed(req_id, e.to_string())));
                             continue;
                         }
                     };
@@ -542,7 +551,9 @@ impl Writer {
                             if stored_hash == request_hash {
                                 let resp = response_json
                                     .and_then(|j| serde_json::from_str::<WriteResponse>(&j).ok())
-                                    .unwrap_or_else(|| WriteResponse::committed(req_id.clone(), None));
+                                    .unwrap_or_else(|| {
+                                        WriteResponse::committed(req_id.clone(), None)
+                                    });
                                 responses.push((respond_to, resp));
                                 continue;
                             } else {
@@ -558,7 +569,8 @@ impl Writer {
                             // New key — proceed.
                         }
                         Err(e) => {
-                            responses.push((respond_to, WriteResponse::failed(req_id, e.to_string())));
+                            responses
+                                .push((respond_to, WriteResponse::failed(req_id, e.to_string())));
                             continue;
                         }
                     }
@@ -666,7 +678,11 @@ impl Writer {
                 Ok(s) => s,
                 Err(e) => sp_fail!(e),
             };
-            match stmt.execute(rusqlite::params![request.request_id, request.actor_id, request.run_id]) {
+            match stmt.execute(rusqlite::params![
+                request.request_id,
+                request.actor_id,
+                request.run_id
+            ]) {
                 Ok(_) => Some(tx.last_insert_rowid()),
                 Err(e) => sp_fail!(e),
             }
@@ -857,7 +873,11 @@ fn json_to_sqlite(v: &serde_json::Value) -> Result<Value> {
 /// before the writer thread starts accepting requests. It is NOT subject to
 /// the `validate_sql` security checks (§23) — those apply only to user-supplied
 /// SQL arriving via the write channel. Internal DDL is always permitted.
-pub(crate) fn run_migrations(conn: &Connection, track_commits: bool, idempotency: bool) -> Result<()> {
+pub(crate) fn run_migrations(
+    conn: &Connection,
+    track_commits: bool,
+    idempotency: bool,
+) -> Result<()> {
     if track_commits {
         // §12 DDL — verbatim from the design specification.
         conn.execute_batch(
@@ -903,13 +923,18 @@ pub(crate) fn run_migrations(conn: &Connection, track_commits: bool, idempotency
 /// return `"memory"` instead; tests should tolerate this).
 pub(crate) fn apply_pragmas(conn: &Connection, config: &GatewayConfig) -> Result<()> {
     // 1. journal_mode — check the applied value (may differ for in-memory DBs).
-    conn.pragma_update_and_check(None, "journal_mode", config.journal_mode.as_pragma_value(), |row| {
-        let _actual_mode: String = row.get(0)?;
-        // We intentionally do not error on WAL non-application (e.g. ":memory:"
-        // returns "memory"). Callers that need strict WAL enforcement should use
-        // a file-backed database. See tech-validation §4 for details.
-        Ok(())
-    })?;
+    conn.pragma_update_and_check(
+        None,
+        "journal_mode",
+        config.journal_mode.as_pragma_value(),
+        |row| {
+            let _actual_mode: String = row.get(0)?;
+            // We intentionally do not error on WAL non-application (e.g. ":memory:"
+            // returns "memory"). Callers that need strict WAL enforcement should use
+            // a file-backed database. See tech-validation §4 for details.
+            Ok(())
+        },
+    )?;
 
     // 2. busy_timeout — use the dedicated Connection method (tech-validation §2).
     conn.busy_timeout(Duration::from_millis(config.busy_timeout_ms))?;
@@ -919,7 +944,11 @@ pub(crate) fn apply_pragmas(conn: &Connection, config: &GatewayConfig) -> Result
 
     // 4. foreign_keys — use integer 1/0 (SQLite treats PRAGMA foreign_keys = 1
     //    identically to = ON; i64 aligns with rusqlite's ToSql integer path).
-    conn.pragma_update(None, "foreign_keys", if config.foreign_keys { 1i64 } else { 0i64 })?;
+    conn.pragma_update(
+        None,
+        "foreign_keys",
+        if config.foreign_keys { 1i64 } else { 0i64 },
+    )?;
 
     Ok(())
 }
@@ -1232,10 +1261,8 @@ mod tests {
 
     fn make_test_writer() -> Writer {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT NOT NULL);",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT NOT NULL);")
+            .unwrap();
 
         let (_, rx) = mpsc::channel(1);
         let config = GatewayConfig {
@@ -1278,10 +1305,8 @@ mod tests {
     fn make_idempotency_writer() -> Writer {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn, true, true).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT NOT NULL);",
-        )
-        .unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT NOT NULL);")
+            .unwrap();
 
         let (_, rx) = mpsc::channel(1);
         let config = GatewayConfig {
@@ -1324,9 +1349,10 @@ mod tests {
     fn test_idempotency_conflict_different_operations() {
         let mut writer = make_idempotency_writer();
 
-        let mut req1 = make_write_request(vec![
-            ("INSERT INTO t(val) VALUES (?)", vec![json!("first")]),
-        ]);
+        let mut req1 = make_write_request(vec![(
+            "INSERT INTO t(val) VALUES (?)",
+            vec![json!("first")],
+        )]);
         req1.request_id = "req-conflict-1".to_string();
         req1.idempotency_key = Some("conflict-key".to_string());
 
@@ -1334,9 +1360,10 @@ mod tests {
         assert_eq!(resp1.status, crate::request::WriteStatus::Committed);
 
         // Second request with the same key but different operations → conflict.
-        let mut req2 = make_write_request(vec![
-            ("INSERT INTO t(val) VALUES (?)", vec![json!("different")]),
-        ]);
+        let mut req2 = make_write_request(vec![(
+            "INSERT INTO t(val) VALUES (?)",
+            vec![json!("different")],
+        )]);
         req2.request_id = "req-conflict-2".to_string();
         req2.idempotency_key = Some("conflict-key".to_string());
 
@@ -1358,9 +1385,10 @@ mod tests {
         let mut writer = make_test_writer();
         assert_eq!(writer.latency_buf.lock().unwrap().len(), 0);
 
-        let req = make_write_request(vec![
-            ("INSERT INTO t(val) VALUES (?)", vec![json!("lat-test")]),
-        ]);
+        let req = make_write_request(vec![(
+            "INSERT INTO t(val) VALUES (?)",
+            vec![json!("lat-test")],
+        )]);
         let resp = writer.apply(req);
         assert_eq!(resp.status, crate::request::WriteStatus::Committed);
 
@@ -1390,7 +1418,10 @@ mod tests {
         let (_, rx) = mpsc::channel(1);
         let config = GatewayConfig {
             allow_schema_write: true,
-            batch: Some(crate::config::BatchConfig { max_size: 64, max_delay_micros: 500 }),
+            batch: Some(crate::config::BatchConfig {
+                max_size: 64,
+                max_delay_micros: 500,
+            }),
             ..GatewayConfig::default()
         };
         let latency_buf = new_latency_buffer();
@@ -1477,16 +1508,26 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 2, "exactly 2 rows must exist after the batch (req-1 and req-3)");
+        assert_eq!(
+            count, 2,
+            "exactly 2 rows must exist after the batch (req-1 and req-3)"
+        );
 
         let vals: Vec<String> = {
-            let mut stmt = writer.conn.prepare("SELECT val FROM t ORDER BY val").unwrap();
+            let mut stmt = writer
+                .conn
+                .prepare("SELECT val FROM t ORDER BY val")
+                .unwrap();
             stmt.query_map([], |r| r.get(0))
                 .unwrap()
                 .map(|r| r.unwrap())
                 .collect()
         };
-        assert_eq!(vals, vec!["apple", "banana"], "only 'apple' and 'banana' must be present");
+        assert_eq!(
+            vals,
+            vec!["apple", "banana"],
+            "only 'apple' and 'banana' must be present"
+        );
     }
 
     /// §10/§23 — validate_sql must be applied in the batch path as well.
@@ -1524,7 +1565,9 @@ mod tests {
         writer.apply_batch(vec![(req1, tx1), (req2, tx2)]);
 
         let resp1 = rx1.try_recv().expect("response for req-valid must be sent");
-        let resp2 = rx2.try_recv().expect("response for req-forbidden must be sent");
+        let resp2 = rx2
+            .try_recv()
+            .expect("response for req-forbidden must be sent");
 
         assert_eq!(
             resp1.status,
@@ -1537,7 +1580,11 @@ mod tests {
             "req-forbidden (BEGIN keyword) must be Failed due to validate_sql (§10/§23)"
         );
         assert!(
-            resp2.error.as_deref().unwrap_or("").contains("forbidden keyword"),
+            resp2
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("forbidden keyword"),
             "error message must mention the forbidden keyword"
         );
 

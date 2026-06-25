@@ -101,8 +101,7 @@ async fn test_jsonrpc_execute_committed() {
     // CREATE TABLE
     let resp = client
         .execute(SqlOperation {
-            sql: "CREATE TABLE IF NOT EXISTS jrpc_events (id INTEGER PRIMARY KEY, val TEXT)"
-                .into(),
+            sql: "CREATE TABLE IF NOT EXISTS jrpc_events (id INTEGER PRIMARY KEY, val TEXT)".into(),
             params: vec![],
         })
         .await
@@ -544,7 +543,10 @@ async fn test_socket_permission_custom_0o660() {
 async fn test_shutdown_removes_socket() {
     let (socket, db, shutdown) = start_gateway().await;
 
-    assert!(socket.exists(), "socket must exist while gateway is running");
+    assert!(
+        socket.exists(),
+        "socket must exist while gateway is running"
+    );
 
     // Trigger graceful shutdown.
     shutdown.notify_one();

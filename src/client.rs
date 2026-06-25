@@ -17,7 +17,7 @@ use std::path::Path;
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{UnixStream, unix::OwnedReadHalf, unix::OwnedWriteHalf},
+    net::{unix::OwnedReadHalf, unix::OwnedWriteHalf, UnixStream},
 };
 use uuid::Uuid;
 
@@ -64,7 +64,10 @@ impl Client {
     ///
     /// `actor_id` is embedded in every [`WriteRequest`] sent through this
     /// client (§8 `actor_id` field).
-    pub async fn connect(actor_id: impl Into<String>, socket_path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn connect(
+        actor_id: impl Into<String>,
+        socket_path: impl AsRef<Path>,
+    ) -> Result<Self> {
         let stream = UnixStream::connect(socket_path.as_ref())
             .await
             .map_err(|e| Error::Io(e.to_string()))?;
@@ -127,7 +130,9 @@ impl Client {
         } else if let Some(err) = v.get("error") {
             Err(Error::Protocol(err.to_string()))
         } else {
-            Err(Error::Protocol(format!("unexpected stats response: {reply}")))
+            Err(Error::Protocol(format!(
+                "unexpected stats response: {reply}"
+            )))
         }
     }
 
@@ -211,7 +216,10 @@ impl Client {
 
         if let Some(result) = v.get("result") {
             // Success response: {"jsonrpc":"2.0","id":"...","result":{"status":"committed","commit_seq":42}}
-            let status_str = result.get("status").and_then(|s| s.as_str()).unwrap_or("failed");
+            let status_str = result
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("failed");
             let commit_seq = result.get("commit_seq").and_then(|s| s.as_i64());
             let status = if status_str == "committed" {
                 WriteStatus::Committed

@@ -22,7 +22,11 @@ use squeuelite::{
 ///
 /// Returns `(addr, gateway_handle, shutdown_tx)`. Send `()` to `shutdown_tx`
 /// to trigger graceful shutdown.
-async fn start_http_gateway() -> (SocketAddr, squeuelite::GatewayHandle, tokio::sync::oneshot::Sender<()>) {
+async fn start_http_gateway() -> (
+    SocketAddr,
+    squeuelite::GatewayHandle,
+    tokio::sync::oneshot::Sender<()>,
+) {
     // OS assigns a free port via TcpListener::bind("127.0.0.1:0").
     // We bind a throwaway listener first, read the port, then close it.
     // This is a race in principle, but works reliably in test isolation.
@@ -74,9 +78,7 @@ async fn post_rpc(addr: SocketAddr, body: serde_json::Value) -> serde_json::Valu
         body_str.len()
     );
 
-    let mut stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("connect");
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
 
     stream
         .write_all(request.as_bytes())
@@ -105,9 +107,7 @@ async fn post_rpc(addr: SocketAddr, body: serde_json::Value) -> serde_json::Valu
 async fn get_health(addr: SocketAddr) -> serde_json::Value {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let request = format!(
-        "GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-    );
+    let request = format!("GET /health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
 
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
@@ -130,8 +130,7 @@ async fn get_health(addr: SocketAddr) -> serde_json::Value {
         .unwrap_or(response.len());
     let body_slice = &response[body_start..];
 
-    serde_json::from_str(body_slice)
-        .unwrap_or_else(|_| serde_json::json!({"raw": body_slice}))
+    serde_json::from_str(body_slice).unwrap_or_else(|_| serde_json::json!({"raw": body_slice}))
 }
 
 // ---------------------------------------------------------------------------

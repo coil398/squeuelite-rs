@@ -20,11 +20,7 @@
 //! as a shared group to connect, set `socket_mode = 0o660` and ensure all
 //! callers belong to the same Unix group (§23).
 
-use std::{
-    fs,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{fs, path::PathBuf, sync::Arc};
 
 use serde_json::Value;
 use tokio::{
@@ -36,7 +32,7 @@ use crate::{
     config::GatewayConfig,
     error::Result,
     inprocess::{GatewayHandle, InProcessGateway},
-    jsonrpc::{ERR_INVALID_REQUEST, MAX_LINE_BYTES, err_json},
+    jsonrpc::{err_json, ERR_INVALID_REQUEST, MAX_LINE_BYTES},
     stats::Stats,
 };
 
@@ -80,10 +76,7 @@ impl SidecarConfig {
     ///
     /// Sets `socket_mode` to `0o600` (owner-only, secure by default).
     /// All connections use JSON-RPC 2.0 over JSON Lines.
-    pub fn new(
-        db_path: impl Into<PathBuf>,
-        socket_path: impl Into<PathBuf>,
-    ) -> Self {
+    pub fn new(db_path: impl Into<PathBuf>, socket_path: impl Into<PathBuf>) -> Self {
         Self {
             gateway: GatewayConfig::new(db_path),
             socket_path: socket_path.into(),
@@ -156,8 +149,8 @@ impl SidecarGateway {
         let _ = std::fs::remove_file(&socket_path);
 
         // Step 2 — bind the Unix Domain Socket.
-        let listener = UnixListener::bind(&socket_path)
-            .map_err(|e| crate::error::Error::Io(e.to_string()))?;
+        let listener =
+            UnixListener::bind(&socket_path).map_err(|e| crate::error::Error::Io(e.to_string()))?;
 
         // Step 2a — set socket permissions (§23).
         //

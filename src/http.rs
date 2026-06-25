@@ -35,20 +35,16 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
-    Json,
     extract::{DefaultBodyLimit, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use serde_json::Value;
 use tokio::net::TcpListener;
 
-use crate::{
-    inprocess::GatewayHandle,
-    stats::Stats,
-};
+use crate::{inprocess::GatewayHandle, stats::Stats};
 
 // ---------------------------------------------------------------------------
 // HttpConfig
@@ -111,10 +107,7 @@ struct AppState {
 /// failed, method not found). This follows the JSON-RPC 2.0 specification,
 /// which uses the JSON envelope for error signalling rather than HTTP status
 /// codes.
-async fn rpc_handler(
-    State(state): State<AppState>,
-    body: axum::body::Bytes,
-) -> impl IntoResponse {
+async fn rpc_handler(State(state): State<AppState>, body: axum::body::Bytes) -> impl IntoResponse {
     // Parse raw bytes to string (accept any valid UTF-8).
     let line = match std::str::from_utf8(&body) {
         Ok(s) => s,
@@ -131,13 +124,8 @@ async fn rpc_handler(
         }
     };
 
-    let reply_str = crate::jsonrpc::dispatch(
-        line,
-        &state.handle,
-        &state.stats,
-        state.db_path.as_path(),
-    )
-    .await;
+    let reply_str =
+        crate::jsonrpc::dispatch(line, &state.handle, &state.stats, state.db_path.as_path()).await;
 
     // The dispatch function returns a JSON string; parse it back to Value so
     // axum can re-serialise it with the correct Content-Type header.

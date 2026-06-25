@@ -31,7 +31,7 @@ use squeuelite::{GatewayConfig, SidecarConfig, SidecarGateway};
 use std::sync::Arc;
 
 #[cfg(feature = "http")]
-use squeuelite::{InProcessGateway, stats::Stats};
+use squeuelite::{stats::Stats, InProcessGateway};
 
 #[tokio::main]
 async fn main() {
@@ -153,7 +153,9 @@ async fn main() {
                     handle_uds,
                     stats_uds,
                     db_path_uds,
-                    async move { let _ = rx.recv().await; },
+                    async move {
+                        let _ = rx.recv().await;
+                    },
                 )
                 .await;
                 if let Err(e) = res {
@@ -168,9 +170,7 @@ async fn main() {
             let addr: std::net::SocketAddr = match http_addr_str.parse() {
                 Ok(a) => a,
                 Err(e) => {
-                    eprintln!(
-                        "[squeuelite-gateway] invalid --http address {http_addr_str:?}: {e}"
-                    );
+                    eprintln!("[squeuelite-gateway] invalid --http address {http_addr_str:?}: {e}");
                     std::process::exit(2);
                 }
             };
@@ -182,7 +182,9 @@ async fn main() {
 
             tasks.push(tokio::spawn(async move {
                 let res = gw
-                    .serve(http_config, async move { let _ = rx.recv().await; })
+                    .serve(http_config, async move {
+                        let _ = rx.recv().await;
+                    })
                     .await;
                 if let Err(e) = res {
                     eprintln!("[squeuelite-gateway] HTTP error: {e}");
@@ -230,8 +232,7 @@ async fn run_uds_inline(
     // Remove stale socket.
     let _ = std::fs::remove_file(path);
 
-    let listener = UnixListener::bind(path)
-        .map_err(|e| squeuelite::Error::Io(e.to_string()))?;
+    let listener = UnixListener::bind(path).map_err(|e| squeuelite::Error::Io(e.to_string()))?;
 
     {
         use std::os::unix::fs::PermissionsExt;

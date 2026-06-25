@@ -34,7 +34,6 @@ pub struct GatewayConfig {
     // -----------------------------------------------------------------------
     // §13 Idempotency
     // -----------------------------------------------------------------------
-
     /// When `true` (the default), the gateway creates the `squeuelite_requests`
     /// table at startup and deduplicates writes by `idempotency_key` (§13).
     ///
@@ -46,7 +45,6 @@ pub struct GatewayConfig {
     // -----------------------------------------------------------------------
     // §23 Security / Safety
     // -----------------------------------------------------------------------
-
     /// When `true` (the default), raw SQL via [`crate::request::SqlOperation`]
     /// is allowed. When `false`, **all** write operations are rejected because
     /// the MVP only supports raw SQL (§10). Future versions will add typed
@@ -71,7 +69,6 @@ pub struct GatewayConfig {
     // -----------------------------------------------------------------------
     // §14 Backpressure
     // -----------------------------------------------------------------------
-
     /// Behaviour when the bounded mpsc channel is full (§14).
     ///
     /// Defaults to [`OverflowPolicy::WaitTimeout`] with a 5000 ms timeout,
@@ -82,7 +79,6 @@ pub struct GatewayConfig {
     // -----------------------------------------------------------------------
     // §15 Batching
     // -----------------------------------------------------------------------
-
     /// Optional batch commit configuration (§15). Defaults to `None` (disabled).
     ///
     /// When `None`, each request is processed as an independent transaction

@@ -47,12 +47,12 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::{
     inprocess::GatewayHandle,
     request::{SqlOperation, WriteRequest, WriteStatus},
-    stats::{Stats, wal_size_bytes},
+    stats::{wal_size_bytes, Stats},
 };
 
 // ---------------------------------------------------------------------------
@@ -136,7 +136,11 @@ pub struct JsonRpcSuccess {
 
 impl JsonRpcSuccess {
     pub fn new(id: Value, result: Value) -> Self {
-        Self { jsonrpc: "2.0", id, result }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result,
+        }
     }
 }
 
@@ -159,20 +163,23 @@ impl JsonRpcError {
         Self {
             jsonrpc: "2.0",
             id,
-            error: RpcErrorObject { code, message: message.into(), data: None },
+            error: RpcErrorObject {
+                code,
+                message: message.into(),
+                data: None,
+            },
         }
     }
 
-    pub fn with_data(
-        id: Value,
-        code: i64,
-        message: impl Into<String>,
-        data: Value,
-    ) -> Self {
+    pub fn with_data(id: Value, code: i64, message: impl Into<String>, data: Value) -> Self {
         Self {
             jsonrpc: "2.0",
             id,
-            error: RpcErrorObject { code, message: message.into(), data: Some(data) },
+            error: RpcErrorObject {
+                code,
+                message: message.into(),
+                data: Some(data),
+            },
         }
     }
 }
@@ -203,12 +210,7 @@ pub fn err_json(id: Value, code: i64, message: impl Into<String>) -> String {
 }
 
 /// Serialise a [`JsonRpcError`] with extra `data` to a JSON string (infallible).
-pub fn err_json_data(
-    id: Value,
-    code: i64,
-    message: impl Into<String>,
-    data: Value,
-) -> String {
+pub fn err_json_data(id: Value, code: i64, message: impl Into<String>, data: Value) -> String {
     serde_json::to_string(&JsonRpcError::with_data(id, code, message, data))
         .unwrap_or_else(|e| format!(r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"internal serialize error: {e}"}}}}"#))
 }
@@ -288,7 +290,11 @@ pub async fn dispatch(
         "stats" => dispatch_stats(id, handle, stats, db_path).await,
         "health" => dispatch_health(id),
         "checkpoint" => dispatch_checkpoint(id, handle).await,
-        other => err_json(id, ERR_METHOD_NOT_FOUND, format!("method not found: {other}")),
+        other => err_json(
+            id,
+            ERR_METHOD_NOT_FOUND,
+            format!("method not found: {other}"),
+        ),
     }
 }
 
@@ -334,7 +340,11 @@ async fn dispatch_execute(
     let operations_arr = match operations_value.as_array() {
         Some(a) if !a.is_empty() => a,
         Some(_) => {
-            return err_json(id, ERR_INVALID_PARAMS, "operations must be a non-empty array");
+            return err_json(
+                id,
+                ERR_INVALID_PARAMS,
+                "operations must be a non-empty array",
+            );
         }
         None => {
             return err_json(id, ERR_INVALID_PARAMS, "operations must be an array");
@@ -375,7 +385,10 @@ async fn dispatch_execute(
                 );
             }
         };
-        ops.push(SqlOperation { sql, params: params_arr });
+        ops.push(SqlOperation {
+            sql,
+            params: params_arr,
+        });
     }
 
     // Optional fields.
@@ -425,10 +438,7 @@ async fn dispatch_execute(
                 err_json_data(id, ERR_WRITE_FAILED, msg, data)
             }
         }
-        Err(
-            crate::error::Error::GatewayOverloaded
-            | crate::error::Error::GatewayClosed,
-        ) => {
+        Err(crate::error::Error::GatewayOverloaded | crate::error::Error::GatewayClosed) => {
             stats.rejected.fetch_add(1, Ordering::Relaxed);
             err_json(id, ERR_GATEWAY_OVERLOADED, "gateway overloaded")
         }
