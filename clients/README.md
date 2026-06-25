@@ -8,8 +8,19 @@ adapt it — they are intentionally ~100 lines each.
 |----------|------|------|--------------|
 | Python   | [`python/squeue.py`](python/squeue.py) | stdlib only | `python3 python/squeue.py ./squeuelite.sock` |
 | Node     | [`node/squeue.mjs`](node/squeue.mjs)   | Node ≥ 16   | `node node/squeue.mjs ./squeuelite.sock` |
+| Deno     | [`deno/squeue.ts`](deno/squeue.ts)     | Deno        | `deno run --allow-read --allow-write deno/squeue.ts ./squeuelite.sock` |
+| Bun      | [`bun/squeue.ts`](bun/squeue.ts)       | Bun         | `bun bun/squeue.ts ./squeuelite.sock` |
 | Go       | [`go/squeue.go`](go/squeue.go)         | `github.com/google/uuid` | import the package |
-| Rust     | built in (`Client`, `sidecar` feature) | —           | see top-level README |
+| JVM (Java) | [`jvm/Squeue.java`](jvm/Squeue.java) | JDK ≥ 16    | `java jvm/Squeue.java ./squeuelite.sock` |
+| Rust     | [`rust/squeue.rs`](rust/squeue.rs) (standalone) · or built-in `Client` (`sidecar` feature) | tokio · serde_json · uuid | copy the module into your crate |
+
+> **Rust note**: the crate ships a built-in `Client`, but it leaves
+> `idempotency_key` / `run_id` as `None`. Use the standalone
+> [`rust/squeue.rs`](rust/squeue.rs) when you need those fields.
+>
+> **JVM note**: `Squeue.java` is dependency-free and returns the raw JSON
+> response line — parse it with Jackson/Gson or your own. Kotlin/Scala/Clojure
+> can call it directly.
 
 All clients implement the same contract:
 
