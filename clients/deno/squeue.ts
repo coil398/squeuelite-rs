@@ -1,4 +1,4 @@
-// Minimal SqueueLite client for Deno — Unix Domain Socket, JSON Lines.
+// Minimal SqueueLite client for Deno — Unix Domain Socket, JSON-RPC 2.0.
 //
 // SqueueLite is *write-only*; read the SQLite file directly (read-only, WAL).
 //
@@ -12,6 +12,8 @@
 //     "INSERT INTO events(agent_id, kind) VALUES (?, ?)",
 //     ["agent-deno", "started"],
 //     { idempotencyKey: "run-7:step-1", runId: "run-7" });
+//   // r == { jsonrpc: "2.0", id: 1, result: { status: "committed", commit_seq: 12 } }
+//   // Check r.result for success, r.error for failure.
 //   db.close();
 
 // Wrap binary data for a BLOB column parameter: {"$blob": "<base64>"}.
@@ -32,6 +34,7 @@ export class Squeue {
   #buf = "";
   #enc = new TextEncoder();
   #dec = new TextDecoder();
+  #counter = 0;
 
   private constructor(conn: Deno.UnixConn, public actorId: string) {
     this.#conn = conn;
@@ -40,6 +43,10 @@ export class Squeue {
   static async connect(path: string, actorId: string): Promise<Squeue> {
     const conn = await Deno.connect({ transport: "unix", path });
     return new Squeue(conn, actorId);
+  }
+
+  #nextId(): number {
+    return ++this.#counter;
   }
 
   // Run one statement as a single atomic transaction.
@@ -52,24 +59,28 @@ export class Squeue {
     ops: Array<[string, unknown[]]>,
     { idempotencyKey, runId }: WriteOpts = {},
   ) {
-    const req: Record<string, unknown> = {
-      request_id: crypto.randomUUID(),
+    const rpcParams: Record<string, unknown> = {
       actor_id: this.actorId,
       operations: ops.map(([sql, params]) => ({ sql, params })),
     };
-    if (runId != null) req.run_id = runId;
-    if (idempotencyKey != null) req.idempotency_key = idempotencyKey;
-    return this.#roundtrip(req);
+    if (runId != null) rpcParams.run_id = runId;
+    if (idempotencyKey != null) rpcParams.idempotency_key = idempotencyKey;
+    return this.#roundtrip({
+      jsonrpc: "2.0",
+      id: this.#nextId(),
+      method: "execute",
+      params: rpcParams,
+    });
   }
 
   stats() {
-    return this.#roundtrip({ type: "stats" });
+    return this.#roundtrip({ jsonrpc: "2.0", id: this.#nextId(), method: "stats" });
   }
   health() {
-    return this.#roundtrip({ type: "health" });
+    return this.#roundtrip({ jsonrpc: "2.0", id: this.#nextId(), method: "health" });
   }
   checkpoint() {
-    return this.#roundtrip({ type: "checkpoint" });
+    return this.#roundtrip({ jsonrpc: "2.0", id: this.#nextId(), method: "checkpoint" });
   }
 
   async #roundtrip(obj: unknown): Promise<Record<string, unknown>> {

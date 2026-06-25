@@ -4,9 +4,9 @@
 //!
 //! ## Protocol
 //!
-//! The client speaks JSON Lines over a [`tokio::net::UnixStream`]:
-//! - One [`WriteRequest`] JSON → one [`WriteResponse`] JSON.
-//! - One admin command JSON → one response JSON.
+//! The client speaks **JSON-RPC 2.0** over JSON Lines on a
+//! [`tokio::net::UnixStream`]. Each request is a single JSON-RPC 2.0 object;
+//! each response is a single JSON-RPC 2.0 object (result or error).
 //!
 //! Each `Client` owns one connection. In-flight requests are serialised
 //! (one outstanding request at a time; no pipelining in the MVP). Pipelining
@@ -14,6 +14,7 @@
 
 use std::path::Path;
 
+use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixStream, unix::OwnedReadHalf, unix::OwnedWriteHalf},
@@ -22,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     error::{Error, Result},
-    request::{SqlOperation, WriteRequest, WriteResponse},
+    request::{SqlOperation, WriteRequest, WriteResponse, WriteStatus},
     stats::StatsSnapshot,
 };
 
@@ -30,7 +31,7 @@ use crate::{
 // Client
 // ---------------------------------------------------------------------------
 
-/// A client that speaks JSON Lines to a running [`crate::SidecarGateway`].
+/// A client that speaks JSON-RPC 2.0 to a running [`crate::SidecarGateway`].
 ///
 /// Obtain via [`Client::connect`]. One `Client` corresponds to one Unix
 /// Domain Socket connection. `&mut self` methods enforce single-in-flight
@@ -107,46 +108,143 @@ impl Client {
     // Admin API (§24)
     // -----------------------------------------------------------------------
 
-    /// Request a statistics snapshot from the gateway (§24 `{ "type": "stats" }`).
+    /// Request a statistics snapshot from the gateway (§24).
+    ///
+    /// Sends `{"jsonrpc":"2.0","id":"...","method":"stats"}` and parses the
+    /// result into a [`StatsSnapshot`].
     pub async fn stats(&mut self) -> Result<StatsSnapshot> {
-        let line = self.send_line(r#"{"type":"stats"}"#).await?;
-        serde_json::from_str(&line).map_err(Error::Json)
+        let id = Uuid::now_v7().to_string();
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "stats"
+        });
+        let req_str = serde_json::to_string(&req).map_err(Error::Json)?;
+        let reply = self.send_line(&req_str).await?;
+        let v: Value = serde_json::from_str(&reply).map_err(Error::Json)?;
+        if let Some(result) = v.get("result") {
+            serde_json::from_value(result.clone()).map_err(Error::Json)
+        } else if let Some(err) = v.get("error") {
+            Err(Error::Protocol(err.to_string()))
+        } else {
+            Err(Error::Protocol(format!("unexpected stats response: {reply}")))
+        }
     }
 
-    /// Check gateway health (§24 `{ "type": "health" }`).
+    /// Check gateway health (§24).
     ///
-    /// Returns `Ok(())` if the gateway responds with `{"status":"ok"}`.
+    /// Sends `{"jsonrpc":"2.0","id":"...","method":"health"}` and returns
+    /// `Ok(())` if the gateway responds with `{"status":"ok"}`.
     pub async fn health(&mut self) -> Result<()> {
-        let _line = self.send_line(r#"{"type":"health"}"#).await?;
-        Ok(())
+        let id = Uuid::now_v7().to_string();
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "health"
+        });
+        let req_str = serde_json::to_string(&req).map_err(Error::Json)?;
+        let reply = self.send_line(&req_str).await?;
+        let v: Value = serde_json::from_str(&reply).map_err(Error::Json)?;
+        if v.get("result").is_some() {
+            Ok(())
+        } else if let Some(err) = v.get("error") {
+            Err(Error::Protocol(err.to_string()))
+        } else {
+            Ok(())
+        }
     }
 
-    /// Request a WAL checkpoint (§24 `{ "type": "checkpoint" }`).
+    /// Request a WAL checkpoint (§24).
     ///
-    /// Returns `Ok(())` if the checkpoint succeeded.
+    /// Sends `{"jsonrpc":"2.0","id":"...","method":"checkpoint"}` and returns
+    /// `Ok(())` if the checkpoint succeeded.
     pub async fn checkpoint(&mut self) -> Result<()> {
-        let line = self.send_line(r#"{"type":"checkpoint"}"#).await?;
-        // Accept {"status":"ok"} or any non-failed response.
-        let v: serde_json::Value = serde_json::from_str(&line).map_err(Error::Json)?;
-        if let Some(status) = v.get("status") {
-            if status == "ok" {
-                return Ok(());
-            }
+        let id = Uuid::now_v7().to_string();
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "checkpoint"
+        });
+        let req_str = serde_json::to_string(&req).map_err(Error::Json)?;
+        let reply = self.send_line(&req_str).await?;
+        let v: Value = serde_json::from_str(&reply).map_err(Error::Json)?;
+        if v.get("result").is_some() {
+            Ok(())
+        } else if let Some(err) = v.get("error") {
+            Err(Error::Protocol(err.to_string()))
+        } else {
+            Ok(())
         }
-        if let Some(err) = v.get("error") {
-            return Err(Error::Protocol(err.to_string()));
-        }
-        Ok(())
     }
 
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    /// Send a JSON-RPC 2.0 execute request and parse the response into a
+    /// [`WriteResponse`].
     async fn send_request(&mut self, req: &WriteRequest) -> Result<WriteResponse> {
-        let line = serde_json::to_string(req).map_err(Error::Json)?;
+        // Build the JSON-RPC 2.0 request envelope.
+        // The internal `WriteRequest` maps to the JSON-RPC `execute` method.
+        let rpc_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": req.request_id,
+            "method": "execute",
+            "params": {
+                "actor_id": req.actor_id,
+                "run_id": req.run_id,
+                "idempotency_key": req.idempotency_key,
+                "operations": req.operations.iter().map(|op| {
+                    serde_json::json!({
+                        "sql": op.sql,
+                        "params": op.params
+                    })
+                }).collect::<Vec<_>>()
+            }
+        });
+
+        let line = serde_json::to_string(&rpc_req).map_err(Error::Json)?;
         let response_line = self.send_line(&line).await?;
-        serde_json::from_str(&response_line).map_err(Error::Json)
+
+        // Parse the JSON-RPC 2.0 response and convert to WriteResponse.
+        let v: Value = serde_json::from_str(&response_line).map_err(Error::Json)?;
+
+        if let Some(result) = v.get("result") {
+            // Success response: {"jsonrpc":"2.0","id":"...","result":{"status":"committed","commit_seq":42}}
+            let status_str = result.get("status").and_then(|s| s.as_str()).unwrap_or("failed");
+            let commit_seq = result.get("commit_seq").and_then(|s| s.as_i64());
+            let status = if status_str == "committed" {
+                WriteStatus::Committed
+            } else {
+                WriteStatus::Failed
+            };
+            Ok(WriteResponse {
+                request_id: req.request_id.clone(),
+                status,
+                commit_seq,
+                error: None,
+            })
+        } else if let Some(err) = v.get("error") {
+            // Error response: {"jsonrpc":"2.0","id":"...","error":{"code":-32000,"message":"..."}}
+            let message = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    // Fall back to the data field if present.
+                    err.get("data").and_then(|d| d.as_str()).map(str::to_string)
+                });
+            Ok(WriteResponse {
+                request_id: req.request_id.clone(),
+                status: WriteStatus::Failed,
+                commit_seq: None,
+                error: message,
+            })
+        } else {
+            Err(Error::Protocol(format!(
+                "unexpected JSON-RPC response: {response_line}"
+            )))
+        }
     }
 
     /// Send a single JSON line and receive the reply line.

@@ -1,4 +1,4 @@
-"""Minimal SqueueLite client — Unix Domain Socket, JSON Lines.
+"""Minimal SqueueLite client — Unix Domain Socket, JSON-RPC 2.0.
 
 SqueueLite is *write-only*. Send writes through this client; read straight from
 the SQLite file with a read-only connection (WAL allows concurrent readers).
@@ -14,7 +14,8 @@ Example
             idempotency_key="run-7:step-1",   # safe to retry
             run_id="run-7",
         )
-        # resp == {"request_id": "...", "status": "committed", "commit_seq": 12}
+        # resp == {"jsonrpc": "2.0", "id": 1, "result": {"status": "committed", "commit_seq": 12}}
+        # Check resp["result"] for success, resp["error"] for failure.
 
 No third-party dependencies; standard library only.
 """
@@ -22,7 +23,6 @@ No third-party dependencies; standard library only.
 import base64
 import json
 import socket
-import uuid
 
 
 def blob(data: bytes) -> dict:
@@ -34,12 +34,6 @@ def blob(data: bytes) -> dict:
     return {"$blob": base64.b64encode(data).decode("ascii")}
 
 
-def _request_id() -> str:
-    # uuid7 is time-ordered (nice for request_id); fall back to uuid4 on <3.13.
-    factory = getattr(uuid, "uuid7", uuid.uuid4)
-    return str(factory())
-
-
 class SqueueError(RuntimeError):
     """Raised when the gateway closes the connection unexpectedly."""
 
@@ -47,10 +41,15 @@ class SqueueError(RuntimeError):
 class Squeue:
     def __init__(self, socket_path: str, actor_id: str):
         self.actor_id = actor_id
+        self._counter = 0
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._sock.connect(socket_path)
         # Buffered, newline-aware IO in both directions.
         self._io = self._sock.makefile("rwb")
+
+    def _next_id(self) -> int:
+        self._counter += 1
+        return self._counter
 
     # -- write API ---------------------------------------------------------
 
@@ -64,27 +63,35 @@ class Squeue:
 
     def transaction(self, ops, *, idempotency_key=None, run_id=None):
         """Run several (sql, params) ops as ONE transaction (all-or-nothing)."""
-        req = {
-            "request_id": _request_id(),
+        rpc_params = {
             "actor_id": self.actor_id,
             "operations": [{"sql": s, "params": list(p)} for (s, p) in ops],
         }
         if run_id is not None:
-            req["run_id"] = run_id
+            rpc_params["run_id"] = run_id
         if idempotency_key is not None:
-            req["idempotency_key"] = idempotency_key
+            rpc_params["idempotency_key"] = idempotency_key
+        req = {
+            "jsonrpc": "2.0",
+            "id": self._next_id(),
+            "method": "execute",
+            "params": rpc_params,
+        }
         return self._roundtrip(json.dumps(req))
 
     # -- admin API ---------------------------------------------------------
 
     def stats(self):
-        return self._roundtrip('{"type":"stats"}')
+        req = {"jsonrpc": "2.0", "id": self._next_id(), "method": "stats"}
+        return self._roundtrip(json.dumps(req))
 
     def health(self):
-        return self._roundtrip('{"type":"health"}')
+        req = {"jsonrpc": "2.0", "id": self._next_id(), "method": "health"}
+        return self._roundtrip(json.dumps(req))
 
     def checkpoint(self):
-        return self._roundtrip('{"type":"checkpoint"}')
+        req = {"jsonrpc": "2.0", "id": self._next_id(), "method": "checkpoint"}
+        return self._roundtrip(json.dumps(req))
 
     # -- internals ---------------------------------------------------------
 
@@ -114,13 +121,12 @@ if __name__ == "__main__":
 
     sock_path = sys.argv[1] if len(sys.argv) > 1 else "./squeuelite.sock"
     with Squeue(sock_path, actor_id="demo-py") as db:
-        print("health:", db.health())
-        print(
-            "write :",
-            db.execute(
-                "INSERT INTO events(agent_id, kind) VALUES (?, ?)",
-                ["demo-py", "started"],
-                idempotency_key="demo:1",
-            ),
+        resp = db.health()
+        print("health:", resp)
+        resp = db.execute(
+            "INSERT INTO events(agent_id, kind) VALUES (?, ?)",
+            ["demo-py", "started"],
+            idempotency_key="demo:1",
         )
+        print("write :", resp)
         print("stats :", db.stats())

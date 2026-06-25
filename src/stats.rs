@@ -1,6 +1,6 @@
 //! Basic gateway statistics (§24 Observability).
 //!
-//! This module is only compiled when the `sidecar` feature is enabled.
+//! This module is compiled when the `sidecar` **or** `http` feature is enabled.
 //!
 //! Tracks accepted/committed/failed/rejected request counts using atomic
 //! counters that are safe to share across async tasks. A `StatsSnapshot`
@@ -21,9 +21,10 @@ use serde::{Deserialize, Serialize};
 /// Shared atomic counters for gateway-level statistics (§24).
 ///
 /// Clone an `Arc<Stats>` to share across the accept loop and per-connection
-/// tasks.
+/// tasks. The struct is `pub` so that callers can share one counter set across
+/// multiple transports (e.g. UDS + HTTP in the same process).
 #[derive(Debug, Default)]
-pub(crate) struct Stats {
+pub struct Stats {
     /// Requests received from clients (before channel send).
     pub accepted: AtomicU64,
     /// Requests that committed successfully.
@@ -36,7 +37,7 @@ pub(crate) struct Stats {
 
 impl Stats {
     /// Create a new, zero-initialised `Stats` wrapped in an `Arc`.
-    pub(crate) fn new_arc() -> Arc<Self> {
+    pub fn new_arc() -> Arc<Self> {
         Arc::new(Self::default())
     }
 

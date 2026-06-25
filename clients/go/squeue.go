@@ -1,4 +1,4 @@
-// Package squeue is a minimal SqueueLite client — Unix Domain Socket, JSON Lines.
+// Package squeue is a minimal SqueueLite client — Unix Domain Socket, JSON-RPC 2.0.
 //
 // SqueueLite is *write-only*. Send writes through this client; read straight
 // from the SQLite file with a read-only connection (WAL allows readers).
@@ -14,9 +14,10 @@
 //		[]any{"agent-go", "started"},
 //		squeue.With{IdempotencyKey: "run-7:step-1", RunID: "run-7"},
 //	)
-//	// resp.Status == "committed"; resp.CommitSeq != nil
+//	// resp["result"] == map[status:committed commit_seq:12]
+//	// Check resp["result"] for success, resp["error"] for failure.
 //
-// Dependency: github.com/google/uuid  (go get github.com/google/uuid)
+// No extra dependencies needed beyond the standard library.
 package squeue
 
 import (
@@ -25,8 +26,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-
-	"github.com/google/uuid"
+	"sync/atomic"
 )
 
 // Op is a single parameterised statement. Params are positional (`?`).
@@ -42,14 +42,6 @@ func Blob(data []byte) map[string]string {
 	return map[string]string{"$blob": base64.StdEncoding.EncodeToString(data)}
 }
 
-// Response is the gateway's reply to a write request.
-type Response struct {
-	RequestID string  `json:"request_id"`
-	Status    string  `json:"status"` // "committed" | "failed"
-	CommitSeq *int64  `json:"commit_seq,omitempty"`
-	Error     *string `json:"error,omitempty"`
-}
-
 // With carries optional request metadata.
 type With struct {
 	IdempotencyKey string // dedup retried writes (e.g. "run-7:step-1")
@@ -61,6 +53,7 @@ type Client struct {
 	actorID string
 	conn    net.Conn
 	r       *bufio.Reader
+	counter atomic.Int64
 }
 
 // Connect dials the gateway socket as actorID.
@@ -72,30 +65,66 @@ func Connect(socketPath, actorID string) (*Client, error) {
 	return &Client{actorID: actorID, conn: conn, r: bufio.NewReader(conn)}, nil
 }
 
+func (c *Client) nextID() int64 {
+	return c.counter.Add(1)
+}
+
 // Execute runs one statement as a single atomic transaction.
-func (c *Client) Execute(sql string, params []any, opts ...With) (*Response, error) {
+func (c *Client) Execute(sql string, params []any, opts ...With) (map[string]any, error) {
 	return c.Transaction([]Op{{SQL: sql, Params: params}}, opts...)
 }
 
 // Transaction runs several ops as ONE transaction (all-or-nothing).
-func (c *Client) Transaction(ops []Op, opts ...With) (*Response, error) {
-	req := map[string]any{
-		"request_id": uuid.NewString(),
+func (c *Client) Transaction(ops []Op, opts ...With) (map[string]any, error) {
+	rpcParams := map[string]any{
 		"actor_id":   c.actorID,
 		"operations": ops,
 	}
 	if len(opts) > 0 {
 		if opts[0].RunID != "" {
-			req["run_id"] = opts[0].RunID
+			rpcParams["run_id"] = opts[0].RunID
 		}
 		if opts[0].IdempotencyKey != "" {
-			req["idempotency_key"] = opts[0].IdempotencyKey
+			rpcParams["idempotency_key"] = opts[0].IdempotencyKey
 		}
+	}
+	req := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      c.nextID(),
+		"method":  "execute",
+		"params":  rpcParams,
 	}
 	return c.roundtrip(req)
 }
 
-func (c *Client) roundtrip(req any) (*Response, error) {
+// Stats returns a JSON-RPC response with server stats in "result".
+func (c *Client) Stats() (map[string]any, error) {
+	return c.roundtrip(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      c.nextID(),
+		"method":  "stats",
+	})
+}
+
+// Health returns a JSON-RPC response with {"status":"ok"} in "result".
+func (c *Client) Health() (map[string]any, error) {
+	return c.roundtrip(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      c.nextID(),
+		"method":  "health",
+	})
+}
+
+// Checkpoint triggers a WAL checkpoint and returns a JSON-RPC response.
+func (c *Client) Checkpoint() (map[string]any, error) {
+	return c.roundtrip(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      c.nextID(),
+		"method":  "checkpoint",
+	})
+}
+
+func (c *Client) roundtrip(req any) (map[string]any, error) {
 	b, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
@@ -107,11 +136,11 @@ func (c *Client) roundtrip(req any) (*Response, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gateway closed the connection: %w", err)
 	}
-	var resp Response
+	var resp map[string]any
 	if err := json.Unmarshal(line, &resp); err != nil {
 		return nil, err
 	}
-	return &resp, nil
+	return resp, nil
 }
 
 // Close closes the connection.

@@ -34,15 +34,19 @@ they differ only in *how* callers reach it.
 | | **In-process** | **Sidecar** |
 |---|---|---|
 | Shape | One Rust process, many async tasks | A **separate process** (`squeuelite-gateway`) |
-| Transport | In-memory channel (no socket) | Unix Domain Socket + JSON Lines |
-| Callers | Rust code via `InProcessGateway` | **Any language** that can write to the socket |
-| Speed | Fastest | Slightly slower (socket hop) |
+| Transport | In-memory channel (no socket) | UDS and/or HTTP — **JSON-RPC 2.0** |
+| Callers | Rust code via `InProcessGateway` | **Any language** that can speak JSON-RPC 2.0 |
+| Speed | Fastest | Slightly slower (socket/network hop) |
 | Use when | All writers live in one Rust binary | Writers are separate OS processes (incl. non-Rust) |
 
 The **sidecar** is the `squeuelite-gateway` binary: a standalone daemon that owns
-the one and only writer connection. Your agent processes don't open the database
-themselves — they send write requests to the daemon's socket, and it serialises
-them into SQLite. This is what lets non-Rust agents (Python, Go, …) write safely.
+the one and only writer connection. All transports use **JSON-RPC 2.0**. One process
+can serve both UDS and HTTP simultaneously, sharing a single writer thread.
+
+| Transport | Flag | Best for |
+|-----------|------|----------|
+| **UDS** (Unix Domain Socket) | `--socket <path>` | Local-only, maximum security via filesystem perms |
+| **HTTP** `POST /rpc` | `--http <addr>` | Cross-host or non-Unix clients; default localhost |
 
 ### In-process (single Rust process, multiple async tasks)
 
@@ -87,11 +91,18 @@ squeuelite = { version = "0.1", features = ["sidecar"] }
 #### Start the gateway binary
 
 ```bash
+# UDS only (JSON-RPC 2.0 over JSON Lines)
 squeuelite-gateway --db ./app.db --socket ./squeuelite.sock
+
+# HTTP only (JSON-RPC 2.0 over HTTP POST /rpc)
+squeuelite-gateway --db ./app.db --http 127.0.0.1:8080
+
+# Both transports simultaneously — one process, one writer
+squeuelite-gateway --db ./app.db --socket ./squeuelite.sock --http 127.0.0.1:8080
 ```
 
-The gateway listens on `./squeuelite.sock` and shuts down cleanly on Ctrl-C
-(WAL checkpoint included).
+At least one of `--socket` or `--http` is required. The gateway shuts down
+cleanly on Ctrl-C (WAL checkpoint included). One process, one SQLite writer.
 
 #### Use the Rust client
 
@@ -119,21 +130,33 @@ let resp = client.transaction(vec![
 ]).await?;
 ```
 
-#### Poke at the socket with socat
+#### Poke at the UDS socket with socat (JSON-RPC 2.0)
 
 ```bash
 # Health check
-echo '{"type":"health"}' | socat UNIX-CONNECT:./squeuelite.sock -
+echo '{"jsonrpc":"2.0","id":1,"method":"health"}' | socat UNIX-CONNECT:./squeuelite.sock -
 
 # Stats snapshot
-echo '{"type":"stats"}' | socat UNIX-CONNECT:./squeuelite.sock -
+echo '{"jsonrpc":"2.0","id":2,"method":"stats"}' | socat UNIX-CONNECT:./squeuelite.sock -
 
 # WAL checkpoint
-echo '{"type":"checkpoint"}' | socat UNIX-CONNECT:./squeuelite.sock -
+echo '{"jsonrpc":"2.0","id":3,"method":"checkpoint"}' | socat UNIX-CONNECT:./squeuelite.sock -
 
-# Write request (table `t` must already exist — see "Setting up your schema")
-echo '{"request_id":"r1","actor_id":"agent-a","operations":[{"sql":"INSERT INTO t(v) VALUES (?)","params":["hello"]}]}' \
+# Execute (table `t` must already exist — see "Setting up your schema")
+echo '{"jsonrpc":"2.0","id":4,"method":"execute","params":{"actor_id":"agent-a","operations":[{"sql":"INSERT INTO t(v) VALUES (?)","params":["hello"]}]}}' \
   | socat UNIX-CONNECT:./squeuelite.sock -
+```
+
+#### Poke at the HTTP endpoint with curl (JSON-RPC 2.0)
+
+```bash
+# Health check (plain HTTP GET)
+curl -s http://127.0.0.1:8080/health
+
+# Execute (JSON-RPC 2.0 POST)
+curl -s -XPOST http://127.0.0.1:8080/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":"r1","method":"execute","params":{"actor_id":"agent-a","operations":[{"sql":"INSERT INTO t(v) VALUES (?)","params":["hello"]}]}}'
 ```
 
 ---
@@ -177,11 +200,12 @@ sending `CREATE TABLE` through the gateway** unless you opt in. Choose one:
 
 ## Features
 
-| Feature      | What it adds                                               |
-|--------------|------------------------------------------------------------|
-| `bundled`    | Compile SQLite from source (default; WAL guaranteed)        |
-| `inprocess`  | `InProcessGateway` + `GatewayHandle` (tokio mpsc actor)    |
-| `sidecar`    | `SidecarGateway` + `Client` + UDS JSON Lines protocol      |
+| Feature      | What it adds                                                        |
+|--------------|---------------------------------------------------------------------|
+| `bundled`    | Compile SQLite from source (default; WAL guaranteed)                 |
+| `inprocess`  | `InProcessGateway` + `GatewayHandle` (tokio mpsc actor)             |
+| `sidecar`    | `SidecarGateway` + `Client` + UDS JSON-RPC 2.0 transport            |
+| `http`       | `HttpGateway` + `HttpConfig` + HTTP JSON-RPC 2.0 (`POST /rpc`)     |
 
 ---
 
@@ -198,34 +222,64 @@ Copy-paste reference clients (Python / Node / Go) live in
 
 ## Protocol (sidecar, §18)
 
-One JSON object per line (`\n` terminated) over a Unix Domain Socket.
+Both transports (UDS and HTTP) use **JSON-RPC 2.0**. The wire format is identical;
+only the transport layer differs.
 
-**Client → Gateway**: A [`WriteRequest`] JSON or an admin command:
+### JSON-RPC 2.0 request format
 
+**UDS**: one JSON object per line (`\n`-terminated) over a Unix Domain Socket.
+**HTTP**: `POST /rpc` with `Content-Type: application/json`; body is one JSON object.
+
+Batch arrays are not supported on either transport.
+
+**Request** (`execute`):
 ```json
-{ "request_id": "01J...", "actor_id": "agent-a", "operations": [...] }
-{ "type": "stats" }
-{ "type": "health" }
-{ "type": "checkpoint" }
+{"jsonrpc":"2.0","id":"<uuid>","method":"execute","params":{"actor_id":"agent-a","operations":[{"sql":"INSERT INTO t(v) VALUES (?)","params":["hello"]}]}}
 ```
 
-**Gateway → Client**: A [`WriteResponse`] JSON or admin response:
-
+**Request** (admin):
 ```json
-{ "request_id": "01J...", "status": "committed", "commit_seq": 42 }
-{ "request_id": "01J...", "status": "failed",    "error": "constraint failed" }
-{ "accepted": 10, "committed": 9, "failed": 1, "rejected": 0, ... }
-{ "status": "ok" }
+{"jsonrpc":"2.0","id":1,"method":"stats"}
+{"jsonrpc":"2.0","id":2,"method":"health"}
+{"jsonrpc":"2.0","id":3,"method":"checkpoint"}
 ```
+
+**Success response**:
+```json
+{"jsonrpc":"2.0","id":"<uuid>","result":{"status":"committed","commit_seq":42}}
+{"jsonrpc":"2.0","id":2,"result":{"status":"ok"}}
+```
+
+**Error response**:
+```json
+{"jsonrpc":"2.0","id":"<uuid>","error":{"code":-32000,"message":"NOT NULL constraint failed: t.v"}}
+{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error: ..."}}
+```
+
+**Error codes**:
+
+| Code | Meaning | When |
+|-----:|---------|------|
+| `-32700` | Parse error | Body / line is not valid JSON |
+| `-32600` | Invalid Request | `jsonrpc != "2.0"`, array, or `method` missing |
+| `-32601` | Method not found | Unknown method name |
+| `-32602` | Invalid params | `actor_id` or `operations` missing / wrong type |
+| `-32000` | write failed | Execute returned `WriteResponse::Failed` |
+| `-32001` | gateway overloaded | Channel full (`Error::GatewayOverloaded`) |
+
+### HTTP health endpoint
+
+`GET /health` returns `{"status":"ok"}` (plain HTTP, no JSON-RPC envelope).
 
 ### Binary data (BLOB)
 
 Params are JSON values, so raw bytes cannot be sent directly. Wrap binary data in a
 `{"$blob": "<base64>"}` sentinel — a single-key object whose value is the
-RFC 4648 standard base64 encoding of the bytes:
+RFC 4648 standard base64 encoding of the bytes. The `$blob` sentinel lives inside
+`operations[].params` and works identically on both UDS and HTTP transports:
 
 ```json
-{"request_id":"r1","actor_id":"agent-a","operations":[{"sql":"INSERT INTO files(data) VALUES (?)","params":[{"$blob":"aGVsbG8="}]}]}
+{"jsonrpc":"2.0","id":"r1","method":"execute","params":{"actor_id":"agent-a","operations":[{"sql":"INSERT INTO files(data) VALUES (?)","params":[{"$blob":"aGVsbG8="}]}]}}
 ```
 
 The gateway decodes the base64 and binds a `BLOB` to the `?` placeholder, so SQLite stores
@@ -237,13 +291,16 @@ by design.
 
 ## Security (§23)
 
-- **Transport**: Unix Domain Sockets only — no TCP. The socket file is created
-  with `0o600` (owner read/write only) by default. Access control is via
-  filesystem permissions. To allow agents running as a different user or in a
-  separate container to connect, set `SidecarConfig.socket_mode = 0o660` (and
-  add all callers to a shared Unix group), or pass `--socket-mode 660` to the
-  `squeuelite-gateway` binary. The default `0o600` is kept as the secure-by-
-  default baseline; relaxing it requires an explicit opt-in.
+- **UDS transport**: Unix Domain Sockets. The socket file is created with
+  `0o600` (owner read/write only) by default. Access control is via filesystem
+  permissions. To allow agents running as a different user or in a separate
+  container to connect, set `SidecarConfig.socket_mode = 0o660` (and add all
+  callers to a shared Unix group), or pass `--socket-mode 660` to the binary.
+  The default `0o600` is the secure-by-default baseline.
+- **HTTP transport**: TCP-exposed. The default bind address is `127.0.0.1`
+  (localhost only). Do **not** change this to `0.0.0.0` without a reverse proxy
+  that handles TLS and authentication. External access and bearer-token
+  authentication are the caller's responsibility.
 - **Trust model**: all callers are assumed to be trusted local processes (MVP).
 - **SQL guard rails**: `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `RELEASE` /
   `PRAGMA` are **always** rejected — the gateway owns the transaction lifecycle.

@@ -1,4 +1,4 @@
-// Minimal SqueueLite client for Bun — Unix Domain Socket, JSON Lines.
+// Minimal SqueueLite client for Bun — Unix Domain Socket, JSON-RPC 2.0.
 //
 // Uses Bun's native `Bun.connect`. (Bun is also node:net compatible, so
 // clients/node/squeue.mjs works under Bun too — this is the Bun-native variant.)
@@ -15,6 +15,8 @@
 //     "INSERT INTO events(agent_id, kind) VALUES (?, ?)",
 //     ["agent-bun", "started"],
 //     { idempotencyKey: "run-7:step-1", runId: "run-7" });
+//   // r == { jsonrpc: "2.0", id: 1, result: { status: "committed", commit_seq: 12 } }
+//   // Check r.result for success, r.error for failure.
 //   db.close();
 
 import type { Socket } from "bun";
@@ -34,6 +36,7 @@ export class Squeue {
   #socket!: Socket;
   #buf = "";
   #waiters: Array<{ resolve: (v: unknown) => void; reject: (e: unknown) => void }> = [];
+  #counter = 0;
 
   private constructor(public actorId: string) {}
 
@@ -76,6 +79,10 @@ export class Squeue {
     while (this.#waiters.length) this.#waiters.shift()!.reject(new Error(msg));
   }
 
+  #nextId(): number {
+    return ++this.#counter;
+  }
+
   #roundtrip(obj: unknown): Promise<unknown> {
     return new Promise((resolve, reject) => {
       this.#waiters.push({ resolve, reject });
@@ -88,24 +95,28 @@ export class Squeue {
   }
 
   transaction(ops: Array<[string, unknown[]]>, { idempotencyKey, runId }: WriteOpts = {}) {
-    const req: Record<string, unknown> = {
-      request_id: crypto.randomUUID(),
+    const rpcParams: Record<string, unknown> = {
       actor_id: this.actorId,
       operations: ops.map(([sql, params]) => ({ sql, params })),
     };
-    if (runId != null) req.run_id = runId;
-    if (idempotencyKey != null) req.idempotency_key = idempotencyKey;
-    return this.#roundtrip(req);
+    if (runId != null) rpcParams.run_id = runId;
+    if (idempotencyKey != null) rpcParams.idempotency_key = idempotencyKey;
+    return this.#roundtrip({
+      jsonrpc: "2.0",
+      id: this.#nextId(),
+      method: "execute",
+      params: rpcParams,
+    });
   }
 
   stats() {
-    return this.#roundtrip({ type: "stats" });
+    return this.#roundtrip({ jsonrpc: "2.0", id: this.#nextId(), method: "stats" });
   }
   health() {
-    return this.#roundtrip({ type: "health" });
+    return this.#roundtrip({ jsonrpc: "2.0", id: this.#nextId(), method: "health" });
   }
   checkpoint() {
-    return this.#roundtrip({ type: "checkpoint" });
+    return this.#roundtrip({ jsonrpc: "2.0", id: this.#nextId(), method: "checkpoint" });
   }
 
   close() {

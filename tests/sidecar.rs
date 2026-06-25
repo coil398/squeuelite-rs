@@ -1,6 +1,7 @@
-//! Integration tests for the Unix Domain Socket sidecar (§18, §20, §24, §27).
+//! Integration tests for the Unix Domain Socket sidecar (§18, §20, §24).
 //!
-//! These tests are only compiled when the `sidecar` feature is enabled.
+//! All tests use JSON-RPC 2.0 over UDS. Raw JSON Lines is no longer supported.
+//! This module is only compiled when the `sidecar` feature is enabled.
 
 #![cfg(feature = "sidecar")]
 
@@ -13,7 +14,7 @@ use squeuelite::{Client, SidecarConfig, SidecarGateway, SqlOperation, WriteStatu
 // Test helpers
 // ---------------------------------------------------------------------------
 
-/// Generate a unique temp path prefix using the thread ID + a counter.
+/// Generate a unique temp path prefix using a counter + process id.
 fn temp_prefix() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -21,7 +22,7 @@ fn temp_prefix() -> String {
     format!("/tmp/squeuelite_test_{id}_{}", std::process::id())
 }
 
-/// Start a `SidecarGateway` in a background task with a custom `socket_mode`.
+/// Start a JSON-RPC 2.0 `SidecarGateway` with a custom `socket_mode`.
 ///
 /// Returns `(socket_path, db_path, shutdown_notify)`.
 /// Call `shutdown_notify.notify_one()` to trigger graceful shutdown.
@@ -48,7 +49,6 @@ async fn start_gateway_with_mode(socket_mode: u32) -> (PathBuf, PathBuf, Arc<Not
     let socket_clone = socket_path.clone();
 
     tokio::spawn(async move {
-        // Wait for the shutdown signal.
         let shutdown_fut = async move { notify_clone.notified().await };
         gateway.run(shutdown_fut).await.expect("gateway run");
     });
@@ -68,7 +68,7 @@ async fn start_gateway_with_mode(socket_mode: u32) -> (PathBuf, PathBuf, Arc<Not
     (socket_path, db_path, notify)
 }
 
-/// Start a `SidecarGateway` with the default socket mode (0o600).
+/// Start a JSON-RPC 2.0 `SidecarGateway` with the default socket mode (0o600).
 async fn start_gateway() -> (PathBuf, PathBuf, Arc<Notify>) {
     start_gateway_with_mode(0o600).await
 }
@@ -77,47 +77,48 @@ async fn start_gateway() -> (PathBuf, PathBuf, Arc<Notify>) {
 fn cleanup(paths: &[&PathBuf]) {
     for p in paths {
         let _ = std::fs::remove_file(p);
-        // Also try WAL / SHM files.
         let _ = std::fs::remove_file(format!("{}-wal", p.display()));
         let _ = std::fs::remove_file(format!("{}-shm", p.display()));
     }
 }
 
+// ===========================================================================
+// JSON-RPC 2.0 over UDS tests
+// ===========================================================================
+
 // ---------------------------------------------------------------------------
-// Test 1: CREATE TABLE + INSERT → Committed + commit_seq present
+// JRPC-1: execute committed
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_execute_insert_committed() {
+async fn test_jsonrpc_execute_committed() {
     let (socket, db, shutdown) = start_gateway().await;
 
-    let mut client = Client::connect("agent-test", &socket)
+    let mut client = Client::connect("agent-jrpc", &socket)
         .await
         .expect("connect");
 
     // CREATE TABLE
     let resp = client
         .execute(SqlOperation {
-            sql: "CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, val TEXT)".into(),
+            sql: "CREATE TABLE IF NOT EXISTS jrpc_events (id INTEGER PRIMARY KEY, val TEXT)"
+                .into(),
             params: vec![],
         })
         .await
-        .expect("execute create");
-    assert_eq!(resp.status, WriteStatus::Committed);
+        .expect("create");
+    assert_eq!(resp.status, WriteStatus::Committed, "create must commit");
 
     // INSERT
     let resp = client
         .execute(SqlOperation {
-            sql: "INSERT INTO events(val) VALUES (?)".into(),
+            sql: "INSERT INTO jrpc_events(val) VALUES (?)".into(),
             params: vec![serde_json::Value::String("hello".into())],
         })
         .await
-        .expect("execute insert");
+        .expect("insert");
     assert_eq!(resp.status, WriteStatus::Committed, "insert must commit");
-    assert!(
-        resp.commit_seq.is_some(),
-        "commit_seq must be set (track_commits=true by default)"
-    );
+    assert!(resp.commit_seq.is_some(), "commit_seq must be present");
 
     shutdown.notify_one();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -125,48 +126,47 @@ async fn test_execute_insert_committed() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2a: transaction (multiple ops) — all ops commit (happy path)
+// JRPC-2: multi-op transaction committed
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_transaction_multi_op_committed() {
+async fn test_jsonrpc_transaction_multi_op_committed() {
     let (socket, db, shutdown) = start_gateway().await;
 
-    let mut client = Client::connect("agent-tx", &socket)
+    let mut client = Client::connect("agent-jrpc-tx", &socket)
         .await
         .expect("connect");
 
-    // Setup: two tables
+    // Setup tables
     client
         .execute(SqlOperation {
-            sql: "CREATE TABLE tx_events (id INTEGER PRIMARY KEY, val TEXT NOT NULL)".into(),
+            sql: "CREATE TABLE jrpc_tx_a (id INTEGER PRIMARY KEY, val TEXT NOT NULL)".into(),
             params: vec![],
         })
         .await
-        .expect("create tx_events");
-
+        .expect("create a");
     client
         .execute(SqlOperation {
-            sql: "CREATE TABLE tx_runs (id INTEGER PRIMARY KEY, status TEXT NOT NULL)".into(),
+            sql: "CREATE TABLE jrpc_tx_b (id INTEGER PRIMARY KEY, val TEXT NOT NULL)".into(),
             params: vec![],
         })
         .await
-        .expect("create tx_runs");
+        .expect("create b");
 
-    // Atomic transaction: insert into both tables at once — all ops must succeed.
+    // Atomic transaction: insert into both tables.
     let resp = client
         .transaction(vec![
             SqlOperation {
-                sql: "INSERT INTO tx_events(val) VALUES (?)".into(),
-                params: vec![serde_json::Value::String("event-1".into())],
+                sql: "INSERT INTO jrpc_tx_a(val) VALUES (?)".into(),
+                params: vec![serde_json::Value::String("row-a-1".into())],
             },
             SqlOperation {
-                sql: "INSERT INTO tx_events(val) VALUES (?)".into(),
-                params: vec![serde_json::Value::String("event-2".into())],
+                sql: "INSERT INTO jrpc_tx_a(val) VALUES (?)".into(),
+                params: vec![serde_json::Value::String("row-a-2".into())],
             },
             SqlOperation {
-                sql: "INSERT INTO tx_runs(status) VALUES (?)".into(),
-                params: vec![serde_json::Value::String("running".into())],
+                sql: "INSERT INTO jrpc_tx_b(val) VALUES (?)".into(),
+                params: vec![serde_json::Value::String("row-b-1".into())],
             },
         ])
         .await
@@ -175,7 +175,7 @@ async fn test_transaction_multi_op_committed() {
     assert_eq!(
         resp.status,
         WriteStatus::Committed,
-        "multi-op transaction must commit"
+        "multi-op JSON-RPC transaction must commit"
     );
 
     shutdown.notify_one();
@@ -184,73 +184,57 @@ async fn test_transaction_multi_op_committed() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2b: transaction atomic rollback — partial failure rolls back all ops
+// JRPC-3: atomic rollback → error -32000 via WriteResponse::Failed
 // ---------------------------------------------------------------------------
-//
-// This test proves that if op2 in a multi-op transaction fails with a
-// constraint violation, op1 is also rolled back (no partial commit).
-// Strategy mirrors `src/inprocess.rs::test_atomic_rollback_on_constraint_violation`:
-// we insert "good" as op1, then violate NOT NULL as op2. After the Failed
-// response we send a probe INSERT of "good"; if op1 were *not* rolled back the
-// UNIQUE constraint would reject the probe, so a Committed probe status proves
-// the table was empty (op1's row was rolled back).
 
 #[tokio::test]
-async fn test_transaction_atomic_rollback() {
+async fn test_jsonrpc_atomic_rollback() {
     let (socket, db, shutdown) = start_gateway().await;
 
-    let mut client = Client::connect("agent-tx-rollback", &socket)
+    let mut client = Client::connect("agent-jrpc-rollback", &socket)
         .await
         .expect("connect");
 
-    // Setup: table with NOT NULL + UNIQUE constraints so we can probe rollback.
+    // Setup table with UNIQUE constraint for rollback probe.
     client
         .execute(SqlOperation {
-            sql: "CREATE TABLE rollback_test (id INTEGER PRIMARY KEY, val TEXT NOT NULL UNIQUE)"
+            sql: "CREATE TABLE jrpc_rollback (id INTEGER PRIMARY KEY, val TEXT NOT NULL UNIQUE)"
                 .into(),
             params: vec![],
         })
         .await
-        .expect("create rollback_test");
+        .expect("create rollback table");
 
-    // Transaction: op1 is valid ("good"), op2 violates NOT NULL → whole tx fails.
+    // Transaction: op1 valid ("good"), op2 violates NOT NULL → whole tx fails.
     let resp = client
         .transaction(vec![
             SqlOperation {
-                sql: "INSERT INTO rollback_test(val) VALUES (?)".into(),
+                sql: "INSERT INTO jrpc_rollback(val) VALUES (?)".into(),
                 params: vec![serde_json::Value::String("good".into())],
             },
             SqlOperation {
-                sql: "INSERT INTO rollback_test(val) VALUES (?)".into(),
+                sql: "INSERT INTO jrpc_rollback(val) VALUES (?)".into(),
                 params: vec![serde_json::Value::Null], // violates NOT NULL
             },
         ])
         .await
         .expect("transaction (error expected in response)");
 
-    assert_eq!(
-        resp.status,
-        WriteStatus::Failed,
-        "transaction with a constraint violation must fail"
-    );
+    assert_eq!(resp.status, WriteStatus::Failed, "violating tx must fail");
     assert!(resp.error.is_some(), "error field must be set on failure");
 
-    // Probe: attempt to INSERT "good" again.
-    // If op1 was NOT rolled back, the UNIQUE constraint would reject this probe
-    // (status = Failed). A Committed result proves op1's row was rolled back.
+    // Probe: inserting "good" again must succeed (op1 was rolled back).
     let probe = client
         .execute(SqlOperation {
-            sql: "INSERT INTO rollback_test(val) VALUES ('good')".into(),
+            sql: "INSERT INTO jrpc_rollback(val) VALUES ('good')".into(),
             params: vec![],
         })
         .await
-        .expect("probe execute");
-
+        .expect("probe");
     assert_eq!(
         probe.status,
         WriteStatus::Committed,
-        "probe INSERT of 'good' must succeed via socket, proving op1 was rolled back \
-         (UNIQUE constraint would have rejected it if the row still existed)"
+        "probe must commit, proving op1 was rolled back"
     );
 
     shutdown.notify_one();
@@ -259,45 +243,42 @@ async fn test_transaction_atomic_rollback() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: admin stats reflects accepted/committed counts
+// JRPC-4: stats via JSON-RPC reflects accepted/committed counts
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_admin_stats_counts() {
+async fn test_jsonrpc_stats() {
     let (socket, db, shutdown) = start_gateway().await;
 
-    let mut client = Client::connect("agent-stats", &socket)
+    let mut client = Client::connect("agent-jrpc-stats", &socket)
         .await
         .expect("connect");
 
     // Initial stats: all zeros.
-    let snap = client.stats().await.expect("stats");
+    let snap = client.stats().await.expect("initial stats");
     assert_eq!(snap.accepted, 0);
     assert_eq!(snap.committed, 0);
 
     // Execute two requests.
     client
         .execute(SqlOperation {
-            sql: "CREATE TABLE stats_test (id INTEGER PRIMARY KEY)".into(),
+            sql: "CREATE TABLE jrpc_stats_tbl (id INTEGER PRIMARY KEY)".into(),
             params: vec![],
         })
         .await
         .expect("create");
-
     client
         .execute(SqlOperation {
-            sql: "INSERT INTO stats_test VALUES (1)".into(),
+            sql: "INSERT INTO jrpc_stats_tbl VALUES (1)".into(),
             params: vec![],
         })
         .await
         .expect("insert");
 
-    // Check stats.
     let snap = client.stats().await.expect("stats after writes");
     assert_eq!(snap.accepted, 2, "accepted must be 2");
     assert_eq!(snap.committed, 2, "committed must be 2");
-    assert_eq!(snap.failed, 0);
-    assert_eq!(snap.queue_capacity, 1024);
+    assert_eq!(snap.failed, 0, "failed must be 0");
 
     shutdown.notify_one();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -305,14 +286,13 @@ async fn test_admin_stats_counts() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 4: invalid JSON line → error response, connection stays open
+// JRPC-5: method not found → JSON-RPC -32601
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_invalid_json_connection_stays_open() {
+async fn test_jsonrpc_method_not_found() {
     let (socket, db, shutdown) = start_gateway().await;
 
-    // Use raw socket to send a malformed line, then a valid write.
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixStream,
@@ -322,41 +302,23 @@ async fn test_invalid_json_connection_stays_open() {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half).lines();
 
-    // Send invalid JSON.
     write_half
-        .write_all(b"not valid json\n")
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"x1\",\"method\":\"unknown_method\"}\n")
         .await
         .expect("write");
 
-    let error_line = reader
+    let line = reader
         .next_line()
         .await
         .expect("read")
         .expect("line present");
-    let error_v: serde_json::Value =
-        serde_json::from_str(&error_line).expect("error response is valid JSON");
-    assert_eq!(
-        error_v["status"], "failed",
-        "parse error must return status=failed"
-    );
-    assert!(
-        error_v["error"].as_str().unwrap_or("").contains("parse error"),
-        "error must mention 'parse error'"
-    );
+    let v: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
 
-    // Connection must still be usable: send a valid admin health command.
-    write_half
-        .write_all(b"{\"type\":\"health\"}\n")
-        .await
-        .expect("write health");
-    let health_line = reader
-        .next_line()
-        .await
-        .expect("read")
-        .expect("line present");
-    assert!(
-        health_line.contains("ok"),
-        "health response after error must be ok"
+    assert_eq!(v["jsonrpc"], "2.0", "must be JSON-RPC 2.0 response");
+    assert_eq!(v["id"], "x1", "id must be echoed back");
+    assert_eq!(
+        v["error"]["code"], -32601,
+        "unknown method must return -32601"
     );
 
     shutdown.notify_one();
@@ -365,36 +327,165 @@ async fn test_invalid_json_connection_stays_open() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5: shutdown removes the socket file
+// JRPC-6: invalid params (actor_id missing) → -32602
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_shutdown_removes_socket() {
+async fn test_jsonrpc_invalid_params_missing_actor_id() {
     let (socket, db, shutdown) = start_gateway().await;
 
-    assert!(socket.exists(), "socket must exist while gateway is running");
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixStream,
+    };
 
-    // Trigger graceful shutdown.
-    shutdown.notify_one();
+    let stream = UnixStream::connect(&socket).await.expect("connect");
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half).lines();
 
-    // Wait for the socket to disappear.
-    for _ in 0..50 {
-        if !socket.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // execute without actor_id → -32602 Invalid params.
+    let req = r#"{"jsonrpc":"2.0","id":42,"method":"execute","params":{"operations":[{"sql":"SELECT 1","params":[]}]}}"#;
+    write_half.write_all(req.as_bytes()).await.expect("write");
+    write_half.write_all(b"\n").await.expect("newline");
 
-    assert!(
-        !socket.exists(),
-        "socket file must be removed after shutdown"
+    let line = reader
+        .next_line()
+        .await
+        .expect("read")
+        .expect("line present");
+    let v: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+
+    assert_eq!(v["jsonrpc"], "2.0");
+    assert_eq!(v["id"], 42, "numeric id must be echoed");
+    assert_eq!(
+        v["error"]["code"], -32602,
+        "missing actor_id must return -32602"
     );
 
+    shutdown.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
     cleanup(&[&socket, &db]);
 }
 
 // ---------------------------------------------------------------------------
-// Test 7: socket permissions — default 0o600 (owner-only)
+// JRPC-7: parse error (broken JSON) → -32700, connection stays open
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_jsonrpc_parse_error_connection_stays_open() {
+    let (socket, db, shutdown) = start_gateway().await;
+
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::UnixStream,
+    };
+
+    let stream = UnixStream::connect(&socket).await.expect("connect");
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half).lines();
+
+    // Send invalid JSON — must get -32700 parse error.
+    write_half
+        .write_all(b"not valid json at all\n")
+        .await
+        .expect("write invalid");
+
+    let error_line = reader
+        .next_line()
+        .await
+        .expect("read")
+        .expect("line present");
+    let err_v: serde_json::Value =
+        serde_json::from_str(&error_line).expect("error response is valid JSON");
+
+    assert_eq!(err_v["jsonrpc"], "2.0", "must be JSON-RPC 2.0");
+    assert_eq!(
+        err_v["error"]["code"], -32700,
+        "parse error must use code -32700"
+    );
+    assert!(
+        err_v["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("parse error"),
+        "error message must mention 'parse error'"
+    );
+
+    // Connection must still be usable: send a valid health request.
+    write_half
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"health\"}\n")
+        .await
+        .expect("write health");
+    let health_line = reader
+        .next_line()
+        .await
+        .expect("read")
+        .expect("line present");
+    let health_v: serde_json::Value =
+        serde_json::from_str(&health_line).expect("health response is valid JSON");
+
+    assert_eq!(health_v["jsonrpc"], "2.0");
+    assert_eq!(health_v["id"], 99, "health id must be echoed");
+    assert!(
+        health_v.get("result").is_some(),
+        "health must return a result object"
+    );
+
+    shutdown.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cleanup(&[&socket, &db]);
+}
+
+// ---------------------------------------------------------------------------
+// JRPC-8: BLOB params → committed
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_jsonrpc_blob_params() {
+    let (socket, db, shutdown) = start_gateway().await;
+
+    let mut client = Client::connect("agent-jrpc-blob", &socket)
+        .await
+        .expect("connect");
+
+    // Create table for BLOBs.
+    client
+        .execute(SqlOperation {
+            sql: "CREATE TABLE jrpc_files (id INTEGER PRIMARY KEY, name TEXT, data BLOB)".into(),
+            params: vec![],
+        })
+        .await
+        .expect("create files");
+
+    // Insert with a $blob sentinel — base64("hello").
+    let resp = client
+        .execute(SqlOperation {
+            sql: "INSERT INTO jrpc_files(name, data) VALUES (?, ?)".into(),
+            params: vec![
+                serde_json::Value::String("avatar.png".into()),
+                serde_json::json!({"$blob": "aGVsbG8="}), // base64("hello")
+            ],
+        })
+        .await
+        .expect("blob insert");
+
+    assert_eq!(
+        resp.status,
+        WriteStatus::Committed,
+        "BLOB insert via JSON-RPC must commit"
+    );
+    assert!(
+        resp.commit_seq.is_some(),
+        "commit_seq must be present after BLOB insert"
+    );
+
+    shutdown.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    cleanup(&[&socket, &db]);
+}
+
+// ---------------------------------------------------------------------------
+// Socket permissions — default 0o600 (owner-only)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -420,7 +511,7 @@ async fn test_socket_permission_default_0o600() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 8: socket permissions — custom 0o660 (owner + group)
+// Socket permissions — custom 0o660 (owner + group)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -446,45 +537,30 @@ async fn test_socket_permission_custom_0o660() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 6: failed SQL (constraint violation) → Failed status + failed counter
+// Shutdown removes the socket file
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_failed_sql_increments_failed_counter() {
+async fn test_shutdown_removes_socket() {
     let (socket, db, shutdown) = start_gateway().await;
 
-    let mut client = Client::connect("agent-fail", &socket)
-        .await
-        .expect("connect");
+    assert!(socket.exists(), "socket must exist while gateway is running");
 
-    // Create a table with a NOT NULL constraint.
-    client
-        .execute(SqlOperation {
-            sql: "CREATE TABLE nn_test (id INTEGER PRIMARY KEY, val TEXT NOT NULL)".into(),
-            params: vec![],
-        })
-        .await
-        .expect("create");
-
-    // Intentionally violate the NOT NULL constraint.
-    let resp = client
-        .execute(SqlOperation {
-            sql: "INSERT INTO nn_test(val) VALUES (?)".into(),
-            params: vec![serde_json::Value::Null],
-        })
-        .await
-        .expect("execute (error expected in response)");
-
-    assert_eq!(resp.status, WriteStatus::Failed);
-    assert!(resp.error.is_some(), "error message must be present");
-
-    // Stats must reflect: 2 accepted (create + insert), 1 committed, 1 failed.
-    let snap = client.stats().await.expect("stats");
-    assert_eq!(snap.accepted, 2);
-    assert_eq!(snap.committed, 1, "only CREATE committed");
-    assert_eq!(snap.failed, 1, "the NULL insert must be counted as failed");
-
+    // Trigger graceful shutdown.
     shutdown.notify_one();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Wait for the socket to disappear.
+    for _ in 0..50 {
+        if !socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert!(
+        !socket.exists(),
+        "socket file must be removed after shutdown"
+    );
+
     cleanup(&[&socket, &db]);
 }

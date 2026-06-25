@@ -1,4 +1,4 @@
-//! Minimal SqueueLite client (raw JSON over UDS) — copy into your project.
+//! Minimal SqueueLite client (JSON-RPC 2.0 over UDS) — copy into your project.
 //!
 //! The crate ships a built-in [`squeuelite::Client`] (enable the `sidecar`
 //! feature). Prefer it for most cases. Use *this* standalone module when you
@@ -11,7 +11,6 @@
 //! ```toml
 //! tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros"] }
 //! serde_json = "1"
-//! uuid = { version = "1", features = ["v7"] }
 //! base64 = "0.22"   # only needed for the `blob()` helper
 //! ```
 //!
@@ -24,10 +23,12 @@
 //!     Some("run-7:step-1"),   // idempotency_key
 //!     Some("run-7"),          // run_id
 //! ).await?;
-//! // resp == {"request_id": "...", "status": "committed", "commit_seq": 12}
+//! // resp["result"] == {"status": "committed", "commit_seq": 12}
+//! // Check resp["result"] for success, resp["error"] for failure.
 //! ```
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{Value, json};
 use tokio::{
@@ -53,6 +54,7 @@ pub struct Squeue {
     actor_id: String,
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
+    counter: AtomicU64,
 }
 
 impl Squeue {
@@ -62,12 +64,19 @@ impl Squeue {
             actor_id: actor_id.to_string(),
             reader: BufReader::new(read_half),
             writer: write_half,
+            counter: AtomicU64::new(0),
         })
+    }
+
+    fn next_id(&self) -> u64 {
+        self.counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Run one statement as a single atomic transaction.
     ///
     /// `params` is a JSON array, e.g. `serde_json::json!(["a", 1, true])`.
+    /// Returns the full JSON-RPC 2.0 response object.
+    /// Check `resp["result"]` for success, `resp["error"]` for failure.
     pub async fn execute(
         &mut self,
         sql: &str,
@@ -80,6 +89,7 @@ impl Squeue {
     }
 
     /// Run several `(sql, params)` ops as ONE transaction (all-or-nothing).
+    /// Returns the full JSON-RPC 2.0 response object.
     pub async fn transaction(
         &mut self,
         ops: Vec<(String, Value)>,
@@ -91,23 +101,42 @@ impl Squeue {
             .map(|(sql, params)| json!({ "sql": sql, "params": params }))
             .collect();
 
-        let mut req = json!({
-            "request_id": uuid::Uuid::now_v7().to_string(),
+        let mut rpc_params = json!({
             "actor_id": self.actor_id,
             "operations": operations,
         });
         if let Some(k) = idempotency_key {
-            req["idempotency_key"] = Value::from(k);
+            rpc_params["idempotency_key"] = Value::from(k);
         }
         if let Some(r) = run_id {
-            req["run_id"] = Value::from(r);
+            rpc_params["run_id"] = Value::from(r);
         }
 
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": self.next_id(),
+            "method": "execute",
+            "params": rpc_params,
+        });
         self.roundtrip(&req).await
     }
 
+    /// Returns the full JSON-RPC 2.0 response object with stats in "result".
     pub async fn stats(&mut self) -> io::Result<Value> {
-        self.roundtrip(&json!({ "type": "stats" })).await
+        let req = json!({ "jsonrpc": "2.0", "id": self.next_id(), "method": "stats" });
+        self.roundtrip(&req).await
+    }
+
+    /// Returns the full JSON-RPC 2.0 response object with {"status":"ok"} in "result".
+    pub async fn health(&mut self) -> io::Result<Value> {
+        let req = json!({ "jsonrpc": "2.0", "id": self.next_id(), "method": "health" });
+        self.roundtrip(&req).await
+    }
+
+    /// Triggers a WAL checkpoint. Returns the full JSON-RPC 2.0 response object.
+    pub async fn checkpoint(&mut self) -> io::Result<Value> {
+        let req = json!({ "jsonrpc": "2.0", "id": self.next_id(), "method": "checkpoint" });
+        self.roundtrip(&req).await
     }
 
     async fn roundtrip(&mut self, req: &Value) -> io::Result<Value> {

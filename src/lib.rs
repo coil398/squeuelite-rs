@@ -59,10 +59,10 @@ pub(crate) mod writer;
 #[cfg(feature = "inprocess")]
 pub mod inprocess;
 
-#[cfg(feature = "sidecar")]
-pub(crate) mod protocol;
+#[cfg(any(feature = "sidecar", feature = "http"))]
+pub mod jsonrpc;
 
-#[cfg(feature = "sidecar")]
+#[cfg(any(feature = "sidecar", feature = "http"))]
 pub mod stats;
 
 #[cfg(feature = "sidecar")]
@@ -70,6 +70,9 @@ pub mod sidecar;
 
 #[cfg(feature = "sidecar")]
 pub mod client;
+
+#[cfg(feature = "http")]
+pub mod http;
 
 // ---------------------------------------------------------------------------
 // Re-exports
@@ -88,5 +91,8 @@ pub use client::Client;
 #[cfg(feature = "sidecar")]
 pub use sidecar::{SidecarConfig, SidecarGateway};
 
-#[cfg(feature = "sidecar")]
+#[cfg(any(feature = "sidecar", feature = "http"))]
 pub use stats::StatsSnapshot;
+
+#[cfg(feature = "http")]
+pub use http::{HttpConfig, HttpGateway};

@@ -1,11 +1,13 @@
-// Minimal SqueueLite client for the JVM (Java 16+) — dependency-free.
+// Minimal SqueueLite client for the JVM (Java 16+) — dependency-free, JSON-RPC 2.0.
 //
 // Uses java.nio Unix Domain Socket support (Java 16+). Kotlin / Scala / Clojure
 // can call it directly. SqueueLite is *write-only*; read the SQLite file
 // directly (read-only, WAL).
 //
-// Methods return the raw JSON response line as a String so you can parse it with
-// whatever JSON library you already use (Jackson, Gson, …) — or none.
+// Methods return the raw JSON-RPC 2.0 response line as a String so you can
+// parse it with whatever JSON library you already use (Jackson, Gson, …) — or
+// none. Successful responses contain a "result" key; error responses contain an
+// "error" key with "code" and "message".
 //
 // Demo:  java clients/jvm/Squeue.java ./squeuelite.sock
 
@@ -20,11 +22,12 @@ import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.List;
-import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class Squeue implements AutoCloseable {
     private final String actorId;
     private final SocketChannel ch;
+    private final AtomicLong counter = new AtomicLong(0);
 
     /**
      * Wrap binary data for a BLOB column parameter ({@code {"$blob": "<base64>"}}).
@@ -39,7 +42,7 @@ public final class Squeue implements AutoCloseable {
         this.ch.connect(UnixDomainSocketAddress.of(socketPath));
     }
 
-    /** Run one statement as a single transaction. Returns the raw JSON response line. */
+    /** Run one statement as a single transaction. Returns the raw JSON-RPC 2.0 response line. */
     public String execute(String sql, List<Object> params) throws IOException {
         return execute(sql, params, null, null);
     }
@@ -48,23 +51,43 @@ public final class Squeue implements AutoCloseable {
     public String execute(String sql, List<Object> params, String idempotencyKey, String runId)
             throws IOException {
         String ops = "[{\"sql\":" + jsonStr(sql) + ",\"params\":" + jsonArray(params) + "}]";
-        return sendRequest(ops, idempotencyKey, runId);
+        return sendExecute(ops, idempotencyKey, runId);
     }
 
-    /** Admin: {"type":"stats"} etc. Returns the raw JSON response line. */
-    public String admin(String type) throws IOException {
-        writeLine("{\"type\":" + jsonStr(type) + "}");
+    /** Admin method (stats / health / checkpoint). Returns the raw JSON-RPC 2.0 response line. */
+    public String stats() throws IOException {
+        return adminMethod("stats");
+    }
+
+    /** Admin method: health check. Returns the raw JSON-RPC 2.0 response line. */
+    public String health() throws IOException {
+        return adminMethod("health");
+    }
+
+    /** Admin method: WAL checkpoint. Returns the raw JSON-RPC 2.0 response line. */
+    public String checkpoint() throws IOException {
+        return adminMethod("checkpoint");
+    }
+
+    private String adminMethod(String method) throws IOException {
+        long id = counter.incrementAndGet();
+        writeLine("{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"method\":" + jsonStr(method) + "}");
         return readLine();
     }
 
-    private String sendRequest(String operationsJson, String idempotencyKey, String runId)
+    private String sendExecute(String operationsJson, String idempotencyKey, String runId)
             throws IOException {
+        long id = counter.incrementAndGet();
+        StringBuilder params = new StringBuilder();
+        params.append("{\"actor_id\":").append(jsonStr(actorId));
+        if (runId != null) params.append(",\"run_id\":").append(jsonStr(runId));
+        if (idempotencyKey != null) params.append(",\"idempotency_key\":").append(jsonStr(idempotencyKey));
+        params.append(",\"operations\":").append(operationsJson).append("}");
+
         StringBuilder b = new StringBuilder();
-        b.append("{\"request_id\":").append(jsonStr(UUID.randomUUID().toString()));
-        b.append(",\"actor_id\":").append(jsonStr(actorId));
-        if (runId != null) b.append(",\"run_id\":").append(jsonStr(runId));
-        if (idempotencyKey != null) b.append(",\"idempotency_key\":").append(jsonStr(idempotencyKey));
-        b.append(",\"operations\":").append(operationsJson).append("}");
+        b.append("{\"jsonrpc\":\"2.0\",\"id\":").append(id);
+        b.append(",\"method\":\"execute\"");
+        b.append(",\"params\":").append(params).append("}");
         writeLine(b.toString());
         return readLine();
     }
@@ -105,8 +128,8 @@ public final class Squeue implements AutoCloseable {
     private static String jsonValue(Object v) {
         if (v == null) return "null";
         if (v instanceof Number || v instanceof Boolean) return v.toString();
-        if (v instanceof Blob b) {
-            return "{\"$blob\":" + jsonStr(Base64.getEncoder().encodeToString(b.data())) + "}";
+        if (v instanceof Blob bl) {
+            return "{\"$blob\":" + jsonStr(Base64.getEncoder().encodeToString(bl.data())) + "}";
         }
         return jsonStr(v.toString());
     }
@@ -137,11 +160,11 @@ public final class Squeue implements AutoCloseable {
     public static void main(String[] args) throws IOException {
         String path = args.length > 0 ? args[0] : "./squeuelite.sock";
         try (Squeue db = new Squeue(path, "demo-jvm")) {
-            System.out.println("health: " + db.admin("health"));
+            System.out.println("health: " + db.health());
             System.out.println("write : " + db.execute(
                     "INSERT INTO events(agent_id, kind) VALUES (?, ?)",
                     List.of("demo-jvm", "started"), "demo:1", null));
-            System.out.println("stats : " + db.admin("stats"));
+            System.out.println("stats : " + db.stats());
         }
     }
 }

@@ -21,6 +21,7 @@ tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time"
 # `time`: required for `tokio::time::timeout` used by `OverflowPolicy::WaitTimeout` (§14).
 uuid = { version = "1", features = ["v7"], optional = true }
 base64 = { version = "0.22", optional = true }
+axum = { version = "0.8", optional = true, default-features = false, features = ["json", "tokio", "http1"] }
 
 [features]
 # `bundled` compiles SQLite from source (SQLite 3.53.x), guaranteeing
@@ -34,6 +35,13 @@ inprocess = ["dep:tokio", "dep:base64"]
 # the sidecar Client. Enables `inprocess` (which brings in tokio), plus
 # the tokio net/io-util/signal features required for UDS accept loops (§18).
 sidecar = ["inprocess", "dep:uuid", "tokio/net", "tokio/io-util", "tokio/signal", "tokio/time"]
+# `http` adds the HTTP JSON-RPC endpoint (POST /rpc, GET /health) via axum 0.8.
+# Enables `inprocess` (for the GatewayHandle) plus the tokio and axum features
+# needed for TcpListener, graceful shutdown, and axum::serve.
+# Default bind address is 127.0.0.1 (localhost); see HttpConfig for override.
+# Security note: HTTP is TCP-exposed; external access and authentication are the
+# caller's responsibility. Bearer token auth can be added via a tower layer.
+http = ["inprocess", "dep:axum", "dep:uuid", "tokio/net", "tokio/signal", "tokio/io-util"]
 
 [[example]]
 name = "inprocess_writer"
