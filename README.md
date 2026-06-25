@@ -181,6 +181,17 @@ sending `CREATE TABLE` through the gateway** unless you opt in. Choose one:
 
 ---
 
+## Integration
+
+For a full walkthrough — protocol details, **per-use-case recipes** (event log,
+run lifecycle, batching, multi-language agents…), retry semantics, and a systemd
+deployment — see **[`docs/integration.md`](docs/integration.md)**.
+
+Copy-paste reference clients (Python / Node / Go) live in
+**[`clients/`](clients/)**; the Rust client is built in (`sidecar` feature).
+
+---
+
 ## Protocol (sidecar, §18)
 
 One JSON object per line (`\n` terminated) over a Unix Domain Socket.
