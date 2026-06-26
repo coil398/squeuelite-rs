@@ -56,48 +56,65 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps --features sidecar,http
 
-  clients:
-    name: clients smoke
+  # One job per language so a failure pinpoints the exact client, and each runs
+  # against its own fresh gateway (no shared-state / idempotency cross-talk).
+  client-smoke:
+    name: client smoke (${{ matrix.client }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        client: [python, node, deno, bun, jvm]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: denoland/setup-deno@v2
+      - if: matrix.client == 'deno'
+        uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-      - uses: actions/setup-java@v4
+      - if: matrix.client == 'bun'
+        uses: oven-sh/setup-bun@v2
+      - if: matrix.client == 'jvm'
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "21"
+      # python3 and node are preinstalled on ubuntu-latest runners.
       - name: Build the gateway
         run: cargo build --bin squeuelite-gateway --features sidecar
-      - name: Smoke-test reference clients against a live gateway
+      - name: Smoke-test the ${{ matrix.client }} client
+        env:
+          CLIENT: ${{ matrix.client }}
         run: |
           set -euxo pipefail
-          sudo apt-get update && sudo apt-get install -y sqlite3
           DB="$RUNNER_TEMP/app.db"
           SOCK="$RUNNER_TEMP/squeuelite.sock"
-          sqlite3 "$DB" 'CREATE TABLE events(id INTEGER PRIMARY KEY, agent_id TEXT, kind TEXT, payload TEXT);'
+          python3 -c "import sqlite3; sqlite3.connect('$DB').execute('CREATE TABLE events(id INTEGER PRIMARY KEY, agent_id TEXT, kind TEXT, payload TEXT)')"
           ./target/debug/squeuelite-gateway --db "$DB" --socket "$SOCK" &
           GW=$!
           trap 'kill $GW 2>/dev/null || true' EXIT
           for _ in $(seq 1 100); do [ -S "$SOCK" ] && break; sleep 0.1; done
           [ -S "$SOCK" ] || { echo "gateway socket was not created"; exit 1; }
-          # Each runnable client connects, writes one row, and must report a
-          # committed result (a connectivity + protocol round-trip smoke test).
-          smoke() { echo "== $1 =="; shift; "$@" | tee /tmp/cli.out; grep -q committed /tmp/cli.out; }
-          smoke python python3 clients/python/squeue.py "$SOCK"
-          smoke node    node clients/node/squeue.mjs "$SOCK"
-          smoke deno    deno run --allow-read --allow-write clients/deno/squeue.ts "$SOCK"
-          smoke bun     bun clients/bun/squeue.ts "$SOCK"
-          smoke jvm     java clients/jvm/Squeue.java "$SOCK"
-          # The Go and Rust reference clients are libraries (no runnable demo);
-          # compile-check the Go one here. The Rust client mirrors the built-in
-          # `Client`, which the test suite already exercises.
-          echo "== go (compile check) =="
-          ( cd clients/go && go mod init squeuelite-client-demo && go build . )
+          case "$CLIENT" in
+            python) python3 clients/python/squeue.py "$SOCK" | tee out.txt ;;
+            node)   node clients/node/squeue.mjs "$SOCK"     | tee out.txt ;;
+            deno)   deno run --allow-read --allow-write clients/deno/squeue.ts "$SOCK" | tee out.txt ;;
+            bun)    bun clients/bun/squeue.ts "$SOCK"        | tee out.txt ;;
+            jvm)    java clients/jvm/Squeue.java "$SOCK"      | tee out.txt ;;
+          esac
+          # The single write the demo issues must come back committed.
+          grep -q committed out.txt
+
+  # The Go and Rust reference clients are libraries (no runnable demo); the Rust
+  # one mirrors the built-in `Client` (already exercised by the test suite), so
+  # we compile-check the Go one here.
+  client-go:
+    name: client go (compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: cd clients/go && go mod init squeuelite-client-demo && go build .
