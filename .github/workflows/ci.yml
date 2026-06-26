@@ -99,7 +99,7 @@ jobs:
           case "$CLIENT" in
             python) python3 clients/python/squeue.py "$SOCK" | tee out.txt ;;
             node)   node clients/node/squeue.mjs "$SOCK"     | tee out.txt ;;
-            deno)   deno run --allow-read --allow-write clients/deno/squeue.ts "$SOCK" | tee out.txt ;;
+            deno)   deno run --allow-read --allow-write --unstable-net clients/deno/squeue.ts "$SOCK" | tee out.txt ;;
             bun)    bun clients/bun/squeue.ts "$SOCK"        | tee out.txt ;;
             jvm)    java clients/jvm/Squeue.java "$SOCK"      | tee out.txt ;;
           esac

@@ -2,8 +2,9 @@
 //
 // SqueueLite is *write-only*; read the SQLite file directly (read-only, WAL).
 //
-// Run the demo (Unix socket connect needs read+write permission on the path):
-//   deno run --allow-read --allow-write clients/deno/squeue.ts ./squeuelite.sock
+// Run the demo (Unix socket connect needs read+write permission, and the
+// `--unstable-net` flag because Deno gates Unix-socket networking as unstable):
+//   deno run --allow-read --allow-write --unstable-net clients/deno/squeue.ts ./squeuelite.sock
 //
 // Example:
 //   import { Squeue } from "./squeue.ts";
