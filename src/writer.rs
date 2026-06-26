@@ -256,7 +256,8 @@ impl Writer {
     /// 3. `BEGIN IMMEDIATE` (§11).
     /// 4. Execute each operation with bound params.
     /// 5. If `track_commits` is set, INSERT into `squeuelite_commits` (§12).
-    /// 6. If idempotency is active, INSERT into `squeuelite_requests` (§13).
+    /// 6. If idempotency is active, INSERT into `squeuelite_requests` (§13)
+    ///    **inside the same transaction** (atomic with steps 4–5).
     /// 7. `COMMIT`. Record latency (§24).
     pub(crate) fn apply(&mut self, request: WriteRequest) -> WriteResponse {
         let req_id = request.request_id.clone();
@@ -323,70 +324,39 @@ impl Writer {
                 }
 
                 // Normal execution path for a new idempotency key.
-                return self.apply_with_idempotency(request, &request_hash);
+                // Clone key/hash into owned Strings before moving `request` into
+                // apply_inner (the borrow of `request.idempotency_key` through
+                // `key` must be released before the move).
+                let key_owned = key.clone();
+                return self.apply_inner(request, Some((key_owned, request_hash)));
             }
         }
 
         // No idempotency key (or idempotency disabled) — standard path.
-        self.apply_inner(request)
-    }
-
-    /// Execute a request and record its result in `squeuelite_requests` (§13).
-    ///
-    /// Called only when `idempotency=true` and the key is new.
-    fn apply_with_idempotency(
-        &mut self,
-        request: WriteRequest,
-        request_hash: &str,
-    ) -> WriteResponse {
-        let key = request.idempotency_key.clone().unwrap_or_default();
-
-        let response = self.apply_inner(request);
-
-        // Only persist a successful commit in the idempotency table.
-        // On failure the transaction was rolled back, so the key row must NOT
-        // be inserted — a failed request is always retryable (§13: "失敗は再実行可能").
-        if response.status == crate::request::WriteStatus::Committed {
-            let response_json = serde_json::to_string(&response).unwrap_or_default();
-            let commit_seq = response.commit_seq;
-            // Insert outside the (already committed) transaction.
-            // A separate write is fine: if this fails the client gets a Committed
-            // response but the idempotency row is absent, meaning the next retry
-            // will re-execute. This is a mild safety trade-off (at-most-once vs.
-            // at-least-once); it favours correctness (never silently ignoring a
-            // new request) over deduplication guarantees.
-            //
-            // A production implementation would include this INSERT inside the same
-            // transaction as the write ops. For the MVP the simple two-phase approach
-            // is sufficient.
-            // §25 — prepare_cached for the fixed idempotency INSERT (called on
-            // every successful commit with a new idempotency key).
-            let _ = self
-                .conn
-                .prepare_cached(
-                    "INSERT OR IGNORE INTO squeuelite_requests \
-                     (idempotency_key, request_hash, status, response_json, commit_seq) \
-                     VALUES (?1, ?2, 'committed', ?3, ?4)",
-                )
-                .and_then(|mut stmt| {
-                    stmt.execute(rusqlite::params![
-                        key,
-                        request_hash,
-                        response_json,
-                        commit_seq
-                    ])
-                });
-        }
-
-        response
+        self.apply_inner(request, None)
     }
 
     /// Core transaction execution logic for single-request paths.
     ///
-    /// Opens a `BEGIN IMMEDIATE` transaction, executes all ops, and commits.
+    /// Opens a `BEGIN IMMEDIATE` transaction, executes all ops, optionally
+    /// inserts into `squeuelite_commits` (§12), optionally inserts into
+    /// `squeuelite_requests` for idempotency (§13), and commits.
+    ///
+    /// `idempotency_record`: `Some((key, hash))` causes the idempotency INSERT
+    /// to be included **inside this transaction** so that the dedup record and
+    /// the user ops are committed atomically (§13 — same guarantee as the batch
+    /// path via [`Self::apply_savepoint`]).  When the transaction fails for any
+    /// reason (op error or COMMIT failure) neither the user data nor the
+    /// idempotency row is persisted, preserving the "failure is retryable"
+    /// invariant (§13: "失敗は再実行可能").
+    ///
     /// Savepoint-based execution for batches is handled separately by
     /// [`Self::apply_savepoint`].
-    fn apply_inner(&mut self, request: WriteRequest) -> WriteResponse {
+    fn apply_inner(
+        &mut self,
+        request: WriteRequest,
+        idempotency_record: Option<(String, String)>,
+    ) -> WriteResponse {
         let req_id = request.request_id.clone();
         let start = Instant::now();
 
@@ -439,6 +409,31 @@ impl Writer {
         } else {
             None
         };
+
+        // §13 — idempotency record (atomic with the write ops and commit_seq).
+        //
+        // Included inside this transaction so that crash between COMMIT and a
+        // separate INSERT cannot leave the user data committed without a dedup
+        // record.  This mirrors the batch path (`apply_savepoint`) which already
+        // performed this insert inside the savepoint scope.
+        // §25 — prepare_cached for the fixed internal INSERT OR IGNORE.
+        if let Some((ref key, ref hash)) = idempotency_record {
+            let resp_preview = WriteResponse::committed(req_id.clone(), commit_seq);
+            let response_json = serde_json::to_string(&resp_preview).unwrap_or_default();
+            let mut stmt = match tx.prepare_cached(
+                "INSERT OR IGNORE INTO squeuelite_requests \
+                 (idempotency_key, request_hash, status, response_json, commit_seq) \
+                 VALUES (?1, ?2, 'committed', ?3, ?4)",
+            ) {
+                Ok(s) => s,
+                Err(e) => return WriteResponse::failed(req_id, e.to_string()),
+            };
+            if let Err(e) =
+                stmt.execute(rusqlite::params![key, hash, response_json, commit_seq])
+            {
+                return WriteResponse::failed(req_id, e.to_string());
+            }
+        }
 
         // COMMIT.
         match tx.commit() {

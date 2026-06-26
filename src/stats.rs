@@ -4,8 +4,8 @@
 //!
 //! Tracks accepted/committed/failed/rejected request counts using atomic
 //! counters that are safe to share across async tasks. A `StatsSnapshot`
-//! can be requested at any time via the admin `{ "type": "stats" }` command
-//! (§24 JSON Lines admin interface).
+//! can be requested at any time via the JSON-RPC 2.0 `{"method":"stats"}` request
+//! (§24 Observability — JSON-RPC 2.0 admin interface).
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -77,8 +77,8 @@ impl Stats {
 
 /// A point-in-time snapshot of gateway statistics (§24).
 ///
-/// Returned by the admin `{ "type": "stats" }` command over the JSON Lines
-/// protocol (§18) and exposed on [`crate::Client::stats`].
+/// Returned by the JSON-RPC 2.0 `{"method":"stats"}` admin request (§24)
+/// and exposed on [`crate::Client::stats`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsSnapshot {
     /// Total write requests accepted (incremented before channel send).

@@ -3,9 +3,11 @@ use serde::{Deserialize, Serialize};
 /// A write request sent to the gateway. One request corresponds to one
 /// SQLite transaction (§9 of the design specification).
 ///
-/// `idempotency_key` is carried as a field so that the sidecar phase (§13)
-/// can implement deduplication without a breaking API change. In the current
-/// in-process MVP, the field is not acted upon.
+/// When `idempotency_key` is set and the gateway is configured with
+/// `idempotency = true` (the default, §13), the gateway deduplicates writes
+/// by this key: a second request with the same key and identical operations
+/// returns the stored response without re-executing; a second request with the
+/// same key but different operations returns an `IdempotencyConflict` error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteRequest {
     /// Caller-supplied unique identifier for this request (e.g. a UUIDv7).
@@ -14,8 +16,11 @@ pub struct WriteRequest {
     pub actor_id: String,
     /// Optional run / job context that groups related requests.
     pub run_id: Option<String>,
-    /// Optional key for idempotent re-delivery (§13). Not enforced by the
-    /// in-process gateway in the current MVP; reserved for future use.
+    /// Optional key for idempotent re-delivery (§13).
+    ///
+    /// When provided and the gateway has `idempotency = true` (the default),
+    /// the gateway deduplicates this request by the key so that retries on
+    /// network or timeout errors do not cause duplicate writes.
     pub idempotency_key: Option<String>,
     /// Ordered list of SQL operations to execute within one transaction.
     pub operations: Vec<SqlOperation>,

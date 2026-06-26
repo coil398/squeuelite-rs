@@ -239,3 +239,80 @@ async fn test_http_invalid_params() {
     let _ = shutdown_tx.send(());
     tokio::time::sleep(Duration::from_millis(50)).await;
 }
+
+// ---------------------------------------------------------------------------
+// HTTP-4: idempotency via HTTP JSON-RPC
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_idempotency_dedup() {
+    let (addr, handle, shutdown_tx) = start_http_gateway().await;
+
+    // Setup: CREATE table via handle (HTTP gateway uses in-memory DB).
+    let _ = handle
+        .execute(squeuelite::WriteRequest {
+            request_id: "http-idem-setup".into(),
+            actor_id: "test".into(),
+            run_id: None,
+            idempotency_key: None,
+            operations: vec![SqlOperation {
+                sql: "CREATE TABLE IF NOT EXISTS http_idem_tbl (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT NOT NULL)".into(),
+                params: vec![],
+            }],
+        })
+        .await
+        .expect("create table via handle");
+
+    // First execute with idempotency_key.
+    let req1 = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "http-idem-1",
+        "method": "execute",
+        "params": {
+            "actor_id": "agent-http-idem",
+            "idempotency_key": "http-idem-key",
+            "operations": [
+                {
+                    "sql": "INSERT INTO http_idem_tbl(val) VALUES (?)",
+                    "params": ["idempotent-value"]
+                }
+            ]
+        }
+    });
+    let resp1 = post_rpc(addr, req1).await;
+    assert_eq!(
+        resp1["result"]["status"], "committed",
+        "first HTTP execute must commit; got: {resp1}"
+    );
+    let commit_seq_1 = resp1["result"]["commit_seq"].clone();
+    assert!(!commit_seq_1.is_null(), "commit_seq must be present");
+
+    // Second execute: same idempotency_key + same ops → dedup, same commit_seq.
+    let req2 = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "http-idem-2",
+        "method": "execute",
+        "params": {
+            "actor_id": "agent-http-idem",
+            "idempotency_key": "http-idem-key",
+            "operations": [
+                {
+                    "sql": "INSERT INTO http_idem_tbl(val) VALUES (?)",
+                    "params": ["idempotent-value"]
+                }
+            ]
+        }
+    });
+    let resp2 = post_rpc(addr, req2).await;
+    assert_eq!(
+        resp2["result"]["status"], "committed",
+        "second HTTP execute (dedup) must also report committed; got: {resp2}"
+    );
+    assert_eq!(
+        resp2["result"]["commit_seq"], commit_seq_1,
+        "second HTTP execute must return the same commit_seq"
+    );
+
+    let _ = shutdown_tx.send(());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}

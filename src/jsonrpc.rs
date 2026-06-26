@@ -22,10 +22,11 @@
 //!
 //! ### Application errors (server-error range `-32000`..`-32099`)
 //!
-//! | Code     | Meaning              | When                                    |
-//! |---------:|----------------------|-----------------------------------------|
+//! | Code     | Meaning              | When                                                               |
+//! |---------:|----------------------|--------------------------------------------------------------------|
 //! | `-32000` | write failed         | Execute returned `WriteResponse::Failed` (constraint / SQL rejected / invalid param) |
-//! | `-32001` | gateway overloaded   | Channel full (`Error::GatewayOverloaded`)|
+//! | `-32001` | gateway overloaded   | Channel full (`Error::GatewayOverloaded`) — caller should retry   |
+//! | `-32002` | gateway closed       | Writer stopped (`Error::GatewayClosed`) — retrying will not help  |
 //!
 //! ## socat examples
 //!
@@ -72,7 +73,15 @@ pub const ERR_INVALID_PARAMS: i64 = -32602;
 /// `message` = error description, `data` = detail string from `WriteResponse.error`.
 pub const ERR_WRITE_FAILED: i64 = -32000;
 /// Application error: bounded channel was full (`Error::GatewayOverloaded`).
+///
+/// The caller should back off and retry; the writer is still running.
 pub const ERR_GATEWAY_OVERLOADED: i64 = -32001;
+/// Application error: writer thread has stopped (`Error::GatewayClosed`).
+///
+/// The gateway is shutting down or has panicked; retrying will not help.
+/// Distinct from [`ERR_GATEWAY_OVERLOADED`] so that clients can tell apart
+/// "overloaded — retry" from "closed — do not retry".
+pub const ERR_GATEWAY_CLOSED: i64 = -32002;
 
 // ---------------------------------------------------------------------------
 // Transport-shared constants
@@ -438,9 +447,13 @@ async fn dispatch_execute(
                 err_json_data(id, ERR_WRITE_FAILED, msg, data)
             }
         }
-        Err(crate::error::Error::GatewayOverloaded | crate::error::Error::GatewayClosed) => {
+        Err(crate::error::Error::GatewayOverloaded) => {
             stats.rejected.fetch_add(1, Ordering::Relaxed);
             err_json(id, ERR_GATEWAY_OVERLOADED, "gateway overloaded")
+        }
+        Err(crate::error::Error::GatewayClosed) => {
+            stats.rejected.fetch_add(1, Ordering::Relaxed);
+            err_json(id, ERR_GATEWAY_CLOSED, "gateway closed")
         }
         Err(e) => {
             stats.failed.fetch_add(1, Ordering::Relaxed);

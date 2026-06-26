@@ -56,7 +56,7 @@ pub enum Error {
     #[error("io error: {0}")]
     Io(String),
 
-    /// A protocol-level error in the JSON Lines exchange with the gateway
+    /// A protocol-level error in the JSON-RPC 2.0 exchange with the gateway
     /// (e.g. an unexpected error response from an admin command).
     #[error("protocol error: {0}")]
     Protocol(String),
