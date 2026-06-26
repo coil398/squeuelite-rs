@@ -428,9 +428,7 @@ impl Writer {
                 Ok(s) => s,
                 Err(e) => return WriteResponse::failed(req_id, e.to_string()),
             };
-            if let Err(e) =
-                stmt.execute(rusqlite::params![key, hash, response_json, commit_seq])
-            {
+            if let Err(e) = stmt.execute(rusqlite::params![key, hash, response_json, commit_seq]) {
                 return WriteResponse::failed(req_id, e.to_string());
             }
         }

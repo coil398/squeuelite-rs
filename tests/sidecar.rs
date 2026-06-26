@@ -573,10 +573,7 @@ async fn test_shutdown_removes_socket() {
 
 /// Helper: send a single raw JSON-RPC 2.0 request over UDS and return the
 /// parsed response value.
-async fn rpc_raw(
-    socket: &std::path::Path,
-    body: serde_json::Value,
-) -> serde_json::Value {
+async fn rpc_raw(socket: &std::path::Path, body: serde_json::Value) -> serde_json::Value {
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::UnixStream,
@@ -822,9 +819,7 @@ async fn test_idempotency_conflict_different_ops() {
         resp2["error"]["code"], -32000,
         "IdempotencyConflict must map to ERR_WRITE_FAILED (-32000); got: {resp2}"
     );
-    let msg = resp2["error"]["message"]
-        .as_str()
-        .unwrap_or("");
+    let msg = resp2["error"]["message"].as_str().unwrap_or("");
     assert!(
         msg.contains("idempotency conflict"),
         "error message must contain 'idempotency conflict'; got: {msg}"
