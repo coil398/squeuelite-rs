@@ -89,9 +89,21 @@ Start: `squeuelite-gateway --db ./app.db --http 127.0.0.1:8080`
 
 > **Security**: HTTP is TCP-exposed. The default bind address is `127.0.0.1`
 > (localhost only). Do **not** use `0.0.0.0` without a reverse proxy that
-> handles TLS and authentication. External access and authentication are the
-> caller's responsibility. Bearer token auth can be added via a tower layer
-> in a future version.
+> handles TLS and authentication.
+>
+> **Optional bearer-token authentication**: set the `SQUEUELITE_HTTP_TOKEN`
+> environment variable to enable `Authorization: Bearer <token>` checks on
+> every `POST /rpc` request. `GET /health` is always unauthenticated (liveness
+> probes must not require credentials). For production deployments exposed
+> beyond localhost, combine bearer-token auth with TLS at a reverse proxy.
+>
+> ```bash
+> export SQUEUELITE_HTTP_TOKEN="my-secret-token"
+> squeuelite-gateway --db ./app.db --http 127.0.0.1:8080
+> ```
+>
+> Using `--http-token <token>` is also supported but **not recommended** — CLI
+> arguments are visible to other processes via `ps`.
 
 #### Execute request (HTTP — using curl)
 
@@ -422,8 +434,9 @@ print(rpc("checkpoint")) # force a WAL checkpoint (e.g. before backup)
 - **UDS socket permissions.** Default `0o600` (owner only). For multi-user / multi-
   container access use `--socket-mode 660` + a shared group.
 - **HTTP security.** Default `127.0.0.1` (localhost). Changing to `0.0.0.0` requires
-  a reverse proxy with TLS and authentication. Bearer token auth can be added via
-  a tower layer (future version).
+  a reverse proxy with TLS and authentication. Enable optional bearer-token auth via
+  `SQUEUELITE_HTTP_TOKEN` env var (or `--http-token` flag, less secure). `GET /health`
+  is always unauthenticated.
 - **Run it under a supervisor.** Example systemd unit (both transports):
 
   ```ini

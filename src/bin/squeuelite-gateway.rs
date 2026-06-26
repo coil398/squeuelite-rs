@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! squeuelite-gateway --db <path> [--socket <path>] [--http <addr>] [--socket-mode <octal>]
+//!                    [--http-token <token>]
 //! ```
 //!
 //! `--db` is required. At least one of `--socket` or `--http` must be given.
@@ -14,6 +15,18 @@
 //!   without a reverse proxy that handles TLS and authentication.
 //! - `--socket-mode <octal>` — optional UDS permission bits (default `600`).
 //!   Pass `660` to allow a shared Unix group.
+//! - `--http-token <token>` — optional bearer token for HTTP authentication.
+//!   **WARNING**: CLI arguments are visible to other processes via `ps`. Prefer
+//!   the `SQUEUELITE_HTTP_TOKEN` environment variable instead.
+//!
+//! ## Bearer-Token Authentication (HTTP)
+//!
+//! Set the `SQUEUELITE_HTTP_TOKEN` environment variable (recommended) or pass
+//! `--http-token <token>` (less secure; visible in `ps`) to require
+//! `Authorization: Bearer <token>` on every `POST /rpc` request.
+//! `GET /health` remains unauthenticated regardless.
+//!
+//! Environment variable takes precedence over the CLI flag when both are set.
 //!
 //! Both `--socket` and `--http` may be specified simultaneously. One
 //! `InProcessGateway` (single writer thread) is shared between both transports.
@@ -22,8 +35,8 @@
 //! ## Security
 //!
 //! UDS: access control via filesystem permissions (`socket_mode`).
-//! HTTP: TCP-exposed; default localhost. External access and authentication are
-//! the caller's responsibility. A bearer-token layer can be added via tower.
+//! HTTP: TCP-exposed; default localhost. For external access, use bearer-token
+//! authentication (`SQUEUELITE_HTTP_TOKEN`) combined with TLS at a reverse proxy.
 
 use squeuelite::{GatewayConfig, SidecarConfig, SidecarGateway};
 
@@ -38,7 +51,7 @@ async fn main() {
     let args = parse_args();
 
     eprintln!(
-        "[squeuelite-gateway] db={}{}{}{}",
+        "[squeuelite-gateway] db={}{}{}{}{}",
         args.db_path,
         args.socket_path
             .as_deref()
@@ -51,6 +64,11 @@ async fn main() {
             .as_deref()
             .map(|a| format!(" http={a}"))
             .unwrap_or_default(),
+        if args.http_token.is_some() {
+            " http_auth=bearer"
+        } else {
+            ""
+        },
     );
 
     // ----- CASE 1: sidecar only (no --http) -----
@@ -177,7 +195,10 @@ async fn main() {
             eprintln!("[squeuelite-gateway] HTTP JSON-RPC 2.0 listening on {http_addr_str}");
 
             let gw = HttpGateway::with_stats(handle.clone(), Arc::clone(&stats), db_path.clone());
-            let http_config = HttpConfig::new(addr);
+            let http_config = HttpConfig {
+                addr,
+                auth_token: args.http_token.clone(),
+            };
             let mut rx = shutdown_tx.subscribe();
 
             tasks.push(tokio::spawn(async move {
@@ -263,15 +284,21 @@ struct Args {
     socket_path: Option<String>,
     socket_mode: Option<u32>,
     http_addr: Option<String>,
+    /// Bearer token for HTTP authentication.
+    ///
+    /// Resolved from `SQUEUELITE_HTTP_TOKEN` env var (preferred) or `--http-token` flag.
+    /// `None` means no authentication is required.
+    http_token: Option<String>,
 }
 
-/// Parse `--db <path> [--socket <path>] [--http <addr>] [--socket-mode <octal>]`.
+/// Parse `--db <path> [--socket <path>] [--http <addr>] [--socket-mode <octal>] [--http-token <token>]`.
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
     let mut db = None;
     let mut socket = None;
     let mut socket_mode = None;
     let mut http_addr = None;
+    let mut http_token_flag: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -311,6 +338,16 @@ fn parse_args() -> Args {
                     http_addr = Some(args[i].clone());
                 }
             }
+            "--http-token" => {
+                i += 1;
+                if i < args.len() {
+                    eprintln!(
+                        "[squeuelite-gateway] WARNING: --http-token is visible in `ps` output. \
+                         Prefer the SQUEUELITE_HTTP_TOKEN environment variable."
+                    );
+                    http_token_flag = Some(args[i].clone());
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -331,13 +368,22 @@ fn parse_args() -> Args {
         std::process::exit(2);
     }
 
+    // Env var takes precedence over CLI flag (env is not visible in `ps`).
+    let http_token = std::env::var("SQUEUELITE_HTTP_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or(http_token_flag);
+
     Args {
         db_path,
         socket_path: socket,
         socket_mode,
         http_addr,
+        http_token,
     }
 }
 
 const USAGE: &str = "Usage: squeuelite-gateway --db <path> [--socket <path>] [--http <addr>] \
-                     [--socket-mode <octal>]\nAt least one of --socket or --http is required.";
+                     [--socket-mode <octal>] [--http-token <token>]\n\
+                     At least one of --socket or --http is required.\n\
+                     Prefer SQUEUELITE_HTTP_TOKEN env var over --http-token (CLI args are visible in ps).";

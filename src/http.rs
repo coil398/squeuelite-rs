@@ -17,14 +17,22 @@
 //!
 //! HTTP is TCP-exposed. The default bind address is `127.0.0.1` (localhost);
 //! **do not** change this to `0.0.0.0` unless you are behind a reverse proxy
-//! that handles TLS and authentication. External access and authentication are
-//! the caller's responsibility. A bearer-token layer can be added via:
+//! that handles TLS and authentication.
 //!
-//! ```text
-//! tower_http::validate_request::ValidateRequestHeaderLayer::bearer("my-token")
-//! ```
+//! ### Optional Bearer-Token Authentication
 //!
-//! applied to the router with `.layer(...)`.
+//! Set [`HttpConfig::auth_token`] to `Some("my-secret-token".into())` to require
+//! `Authorization: Bearer <token>` on every `POST /rpc` request. When a token is
+//! configured, requests without the header or with a wrong token receive
+//! `401 Unauthorized`. `GET /health` is always allowed (liveness probes must
+//! not require credentials).
+//!
+//! The token is best supplied via the `SQUEUELITE_HTTP_TOKEN` environment variable
+//! rather than `--http-token` CLI flag, because CLI arguments are visible to
+//! other processes via `ps`.
+//!
+//! For production deployments exposed beyond localhost, pair bearer-token auth
+//! with TLS termination at a reverse proxy.
 //!
 //! ## Single-process, single-writer
 //!
@@ -36,7 +44,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
     extract::{DefaultBodyLimit, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -59,26 +67,70 @@ use crate::{inprocess::GatewayHandle, stats::Stats};
 ///
 /// Keep the default `127.0.0.1` for local-only deployments. Changing to
 /// `0.0.0.0` exposes the endpoint on all interfaces without authentication.
-/// Add a bearer-token tower layer or put this behind a TLS-terminating proxy
-/// before exposing it externally.
-#[derive(Debug, Clone)]
+/// Set [`HttpConfig::auth_token`] to require a bearer token on `POST /rpc`,
+/// and put the service behind a TLS-terminating proxy before exposing it
+/// externally.
+///
+/// ## Optional Bearer-Token Authentication
+///
+/// ```no_run
+/// use squeuelite::HttpConfig;
+/// let config = HttpConfig {
+///     addr: "127.0.0.1:8080".parse().unwrap(),
+///     auth_token: Some("my-secret-token".into()),
+/// };
+/// ```
+///
+/// When `auth_token` is `Some`, every `POST /rpc` must include:
+/// ```text
+/// Authorization: Bearer my-secret-token
+/// ```
+/// Missing or incorrect tokens receive `401 Unauthorized`. `GET /health` is
+/// always allowed (no token required) so liveness probes continue to work.
+///
+/// Supply the token via the `SQUEUELITE_HTTP_TOKEN` environment variable rather
+/// than a CLI flag to avoid leaking it in `ps` output.
+#[derive(Clone)]
 pub struct HttpConfig {
     /// TCP address to bind (default: `127.0.0.1:8080`).
     pub addr: SocketAddr,
+    /// Optional bearer token required on `POST /rpc`.
+    ///
+    /// `None` (default) disables authentication — all requests are accepted.
+    /// `Some(token)` enforces `Authorization: Bearer <token>` on `/rpc`.
+    /// `GET /health` is always allowed regardless of this setting.
+    pub auth_token: Option<String>,
+}
+
+impl std::fmt::Debug for HttpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the token value (avoid leaking it via Debug output / logs).
+        f.debug_struct("HttpConfig")
+            .field("addr", &self.addr)
+            .field(
+                "auth_token",
+                &self.auth_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             addr: "127.0.0.1:8080".parse().expect("valid default addr"),
+            auth_token: None,
         }
     }
 }
 
 impl HttpConfig {
-    /// Create a config binding to the given address.
+    /// Create a config binding to the given address with no authentication.
     pub fn new(addr: SocketAddr) -> Self {
-        Self { addr }
+        Self {
+            addr,
+            auth_token: None,
+        }
     }
 }
 
@@ -92,6 +144,9 @@ struct AppState {
     handle: GatewayHandle,
     stats: Arc<Stats>,
     db_path: PathBuf,
+    /// Optional bearer token for `POST /rpc` authentication.
+    /// `None` means no authentication is required.
+    auth_token: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,13 +156,38 @@ struct AppState {
 /// `POST /rpc` — JSON-RPC 2.0 handler.
 ///
 /// The request body must be a JSON-RPC 2.0 object (not a batch array).
-/// The response is always `200 OK` with a JSON-RPC 2.0 result or error body.
+/// The response is always `200 OK` with a JSON-RPC 2.0 result or error body,
+/// unless bearer-token authentication is configured and the request fails it
+/// (in which case `401 Unauthorized` is returned before dispatch).
 ///
 /// Note: HTTP 200 is returned even for JSON-RPC application errors (e.g. write
 /// failed, method not found). This follows the JSON-RPC 2.0 specification,
 /// which uses the JSON envelope for error signalling rather than HTTP status
 /// codes.
-async fn rpc_handler(State(state): State<AppState>, body: axum::body::Bytes) -> impl IntoResponse {
+async fn rpc_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    // Bearer-token authentication (§23, optional).
+    //
+    // When `auth_token` is configured, the `Authorization` header must be
+    // present and match `Bearer <token>`. Missing or wrong tokens return 401.
+    // `GET /health` bypasses this handler entirely, so no token is needed there.
+    if let Some(ref expected) = state.auth_token {
+        let authorized = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(|token| token == expected.as_str())
+            .unwrap_or(false);
+
+        if !authorized {
+            let body = Json(serde_json::json!({"error": "unauthorized"}));
+            return (StatusCode::UNAUTHORIZED, body).into_response();
+        }
+    }
+
     // Parse raw bytes to string (accept any valid UTF-8).
     let line = match std::str::from_utf8(&body) {
         Ok(s) => s,
@@ -209,6 +289,7 @@ impl HttpGateway {
             handle: self.handle,
             stats: self.stats,
             db_path: self.db_path,
+            auth_token: config.auth_token,
         };
 
         // Explicitly cap the request body at MAX_LINE_BYTES (shared with the UDS

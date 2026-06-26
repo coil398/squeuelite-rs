@@ -133,6 +133,105 @@ async fn get_health(addr: SocketAddr) -> serde_json::Value {
     serde_json::from_str(body_slice).unwrap_or_else(|_| serde_json::json!({"raw": body_slice}))
 }
 
+/// Low-level HTTP response: status line + body.
+struct HttpResponse {
+    status: u16,
+    body: serde_json::Value,
+}
+
+/// Send a raw HTTP/1.1 POST to `addr` at `/rpc` with an optional
+/// `Authorization` header and return the full response (status + body).
+async fn post_rpc_raw(
+    addr: SocketAddr,
+    body: serde_json::Value,
+    auth_header: Option<&str>,
+) -> HttpResponse {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let body_str = serde_json::to_string(&body).expect("serialize body");
+    let auth_line = auth_header
+        .map(|h| format!("Authorization: {h}\r\n"))
+        .unwrap_or_default();
+    let request = format!(
+        "POST /rpc HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth_line}Connection: close\r\n\r\n{body_str}",
+        body_str.len()
+    );
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .await
+        .expect("read response");
+
+    // Parse status code from the first line (e.g. "HTTP/1.1 401 Unauthorized").
+    let status: u16 = response
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let body_start = response
+        .find("\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(response.len());
+    let body_slice = &response[body_start..];
+
+    let body_value =
+        serde_json::from_str(body_slice).unwrap_or_else(|_| serde_json::json!({"raw": body_slice}));
+
+    HttpResponse {
+        status,
+        body: body_value,
+    }
+}
+
+/// Start an `HttpGateway` with bearer-token authentication enabled.
+///
+/// Returns `(addr, shutdown_tx)`.
+async fn start_http_gateway_with_token(
+    token: &str,
+) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind probe");
+    let addr = probe.local_addr().expect("local addr");
+    drop(probe);
+
+    let mut config = GatewayConfig::new(":memory:");
+    config.allow_schema_write = true;
+    config.track_commits = true;
+    let gw = InProcessGateway::open_with_config(config).expect("open gateway");
+
+    let http_gw = HttpGateway::new(gw.handle(), ":memory:");
+    let http_config = HttpConfig {
+        addr,
+        auth_token: Some(token.to_string()),
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        let shutdown = async move {
+            let _ = rx.await;
+        };
+        if let Err(e) = http_gw.serve(http_config, shutdown).await {
+            eprintln!("[test] http gateway error: {e}");
+        }
+        gw.shutdown().await.ok();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    (addr, tx)
+}
+
 // ---------------------------------------------------------------------------
 // HTTP-1: execute committed
 // ---------------------------------------------------------------------------
@@ -311,6 +410,157 @@ async fn test_http_idempotency_dedup() {
     assert_eq!(
         resp2["result"]["commit_seq"], commit_seq_1,
         "second HTTP execute must return the same commit_seq"
+    );
+
+    let _ = shutdown_tx.send(());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+// ===========================================================================
+// HTTP auth tests — bearer-token authentication (§23)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// HTTP-AUTH-1: no token header → 401
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_auth_no_token_returns_401() {
+    let (addr, shutdown_tx) = start_http_gateway_with_token("secret-token-abc").await;
+
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "auth-no-token",
+        "method": "health",
+    });
+
+    // POST /rpc without Authorization header.
+    let resp = post_rpc_raw(addr, req, None).await;
+    assert_eq!(
+        resp.status, 401,
+        "missing Authorization header must return 401; got status={}",
+        resp.status
+    );
+    assert_eq!(
+        resp.body["error"], "unauthorized",
+        "body must contain {{\"error\":\"unauthorized\"}}; got: {}",
+        resp.body
+    );
+
+    let _ = shutdown_tx.send(());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP-AUTH-2: wrong token → 401
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_auth_wrong_token_returns_401() {
+    let (addr, shutdown_tx) = start_http_gateway_with_token("correct-token").await;
+
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "auth-wrong-token",
+        "method": "health",
+    });
+
+    let resp = post_rpc_raw(addr, req, Some("Bearer wrong-token")).await;
+    assert_eq!(
+        resp.status, 401,
+        "wrong token must return 401; got status={}",
+        resp.status
+    );
+    assert_eq!(
+        resp.body["error"], "unauthorized",
+        "body must contain {{\"error\":\"unauthorized\"}}; got: {}",
+        resp.body
+    );
+
+    let _ = shutdown_tx.send(());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP-AUTH-3: correct token → 200 + committed
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_auth_correct_token_returns_200() {
+    let token = "my-gateway-secret";
+    let (addr, shutdown_tx) = start_http_gateway_with_token(token).await;
+
+    // CREATE table via the authenticated /rpc endpoint.
+    let create_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "auth-create",
+        "method": "execute",
+        "params": {
+            "actor_id": "test-auth",
+            "operations": [{
+                "sql": "CREATE TABLE IF NOT EXISTS auth_test (id INTEGER PRIMARY KEY, val TEXT)",
+                "params": []
+            }]
+        }
+    });
+    let create_resp = post_rpc_raw(addr, create_req, Some(&format!("Bearer {token}"))).await;
+    assert_eq!(
+        create_resp.status, 200,
+        "CREATE with correct token must return 200; got status={}",
+        create_resp.status
+    );
+    assert_eq!(
+        create_resp.body["result"]["status"], "committed",
+        "CREATE must commit; got: {}",
+        create_resp.body
+    );
+
+    // INSERT via authenticated /rpc.
+    let insert_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "auth-insert",
+        "method": "execute",
+        "params": {
+            "actor_id": "test-auth",
+            "operations": [{
+                "sql": "INSERT INTO auth_test(val) VALUES (?)",
+                "params": ["hello"]
+            }]
+        }
+    });
+    let insert_resp = post_rpc_raw(addr, insert_req, Some(&format!("Bearer {token}"))).await;
+    assert_eq!(
+        insert_resp.status, 200,
+        "INSERT with correct token must return 200; got status={}",
+        insert_resp.status
+    );
+    assert_eq!(
+        insert_resp.body["result"]["status"], "committed",
+        "INSERT must commit; got: {}",
+        insert_resp.body
+    );
+    assert!(
+        !insert_resp.body["result"]["commit_seq"].is_null(),
+        "commit_seq must be present"
+    );
+
+    let _ = shutdown_tx.send(());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP-AUTH-4: /health is unauthenticated even when auth_token is configured
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_http_auth_health_no_token_required() {
+    let (addr, shutdown_tx) = start_http_gateway_with_token("some-token").await;
+
+    // GET /health must return 200 without any token.
+    let resp = get_health(addr).await;
+    assert_eq!(
+        resp["status"], "ok",
+        "GET /health must return {{\"status\":\"ok\"}} even when auth is enabled; got: {resp}"
     );
 
     let _ = shutdown_tx.send(());

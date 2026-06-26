@@ -2,7 +2,9 @@
 name = "squeuelite"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+# No rust-version pin: the dependency tree (bundled libsqlite3-sys, hashbrown)
+# tracks recent stable Rust, so a fixed MSRV would be misleading. Build with a
+# current stable toolchain.
 description = "A single-writer gateway for SQLite-backed agent systems: serializes concurrent writes through one SQLite writer."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/coil398/squeuelite-rs"
