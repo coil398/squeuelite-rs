@@ -89,7 +89,7 @@ pub struct GatewayConfig {
     pub batch: Option<BatchConfig>,
 }
 
-/// Behaviour of [`GatewayHandle::execute`] when the bounded mpsc channel is
+/// Behaviour of `GatewayHandle::execute` when the bounded mpsc channel is
 /// full (§14 Backpressure).
 ///
 /// The design spec offers three options:

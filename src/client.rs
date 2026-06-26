@@ -60,7 +60,7 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connect to a [`SidecarGateway`] socket as `actor_id` (§20.2).
+    /// Connect to a `SidecarGateway` socket as `actor_id` (§20.2).
     ///
     /// `actor_id` is embedded in every [`WriteRequest`] sent through this
     /// client (§8 `actor_id` field).

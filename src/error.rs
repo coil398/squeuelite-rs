@@ -3,7 +3,7 @@ use thiserror::Error;
 /// Errors returned by the public SqueueLite API.
 ///
 /// The library never leaks `anyhow` into its public surface; callers always get
-/// a concrete [`Error`]. Examples and CLIs are free to use `anyhow` on top.
+/// a concrete [`enum@Error`]. Examples and CLIs are free to use `anyhow` on top.
 #[derive(Debug, Error)]
 pub enum Error {
     /// An error originating from the underlying SQLite driver.

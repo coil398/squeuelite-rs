@@ -23,7 +23,7 @@ use crate::{
 /// ## Shutdown behaviour
 ///
 /// The recommended shutdown path is the explicit [`InProcessGateway::shutdown`]
-/// async method: it sends a [`Command::Shutdown`] to the writer thread, then
+/// async method: it sends a `Command::Shutdown` to the writer thread, then
 /// blocks until the thread finishes (which includes the WAL checkpoint, §16).
 ///
 /// When `InProcessGateway` is dropped without calling `shutdown`, the `Drop`
@@ -126,7 +126,7 @@ impl InProcessGateway {
 
     /// Gracefully shut down the gateway.
     ///
-    /// Sends [`Command::Shutdown`] to the writer thread, waits for it to
+    /// Sends `Command::Shutdown` to the writer thread, waits for it to
     /// finish (which includes the WAL checkpoint), and consumes `self`.
     ///
     /// Returns [`Error::GatewayClosed`] if the writer thread panicked.
