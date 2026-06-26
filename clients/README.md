@@ -13,7 +13,7 @@ and adapt it — they are intentionally ~100 lines each.
 |----------|------|------|--------------|
 | Python   | [`python/squeue.py`](python/squeue.py) | stdlib only | `python3 python/squeue.py ./squeuelite.sock` |
 | Node     | [`node/squeue.mjs`](node/squeue.mjs)   | Node ≥ 16   | `node node/squeue.mjs ./squeuelite.sock` |
-| Deno     | [`deno/squeue.ts`](deno/squeue.ts)     | Deno        | `deno run --allow-read --allow-write --unstable-net deno/squeue.ts ./squeuelite.sock` |
+| Deno     | [`deno/squeue.ts`](deno/squeue.ts)     | Deno        | `deno run --allow-read --allow-write --allow-net deno/squeue.ts ./squeuelite.sock` |
 | Bun      | [`bun/squeue.ts`](bun/squeue.ts)       | Bun         | `bun bun/squeue.ts ./squeuelite.sock` |
 | Go       | [`go/squeue.go`](go/squeue.go)         | stdlib only | import the package |
 | JVM (Java) | [`jvm/Squeue.java`](jvm/Squeue.java) | JDK ≥ 16    | `java jvm/Squeue.java ./squeuelite.sock` |
