@@ -11,11 +11,10 @@
 
 # SqueueLite
 
+**English** | [日本語](README.ja.md)
+
 **SqueueLite is not a job queue.**
 It is a SQLite write queue: a single-writer gateway for SQLite-backed agent systems.
-
-**SqueueLite はジョブキューではない。**
-SQLite への書き込み要求を単一 writer に集約する write gateway である。
 
 > Many agents. One SQLite writer. No job queue.
 
