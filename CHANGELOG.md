@@ -4,11 +4,11 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); the project aims to follow
 [Semantic Versioning](https://semver.org/) once it reaches 1.0.
 
-## [Unreleased]
+## [0.1.0] - 2026-07-03
 
-Initial development toward `0.1.0`. SqueueLite is a **single-writer SQLite write
-gateway** (not a job queue): it serialises concurrent writes from many agents
-through one `rusqlite::Connection`.
+Initial release. SqueueLite is a **single-writer SQLite write gateway** (not a job
+queue): it serialises concurrent writes from many agents through one
+`rusqlite::Connection`.
 
 ### Added
 
@@ -34,4 +34,4 @@ through one `rusqlite::Connection`.
 - Docs: `docs/integration.md`, per-language `clients/`, `SECURITY.md`,
   `CONTRIBUTING.md`.
 
-[Unreleased]: https://github.com/coil398/squeuelite-rs/commits/main
+[0.1.0]: https://github.com/coil398/squeuelite-rs/releases/tag/v0.1.0

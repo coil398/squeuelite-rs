@@ -31,6 +31,12 @@ becomes one atomic `BEGIN IMMEDIATE … COMMIT` transaction. Callers get a
 What it does **not** do: schedule jobs, manage workers, retry failed operations,
 or run long-lived background tasks.
 
+**When to reach for it:** if all your writers live in one Rust process, a thin
+actor such as [`tokio-rusqlite`](https://crates.io/crates/tokio-rusqlite) already
+covers that case. SqueueLite earns its keep when writers are **separate processes
+or non-Rust languages** and you want one gateway — idempotency, batching,
+backpressure, JSON-RPC over UDS/HTTP — in front of the single writer.
+
 ---
 
 ## Modes
